@@ -11,9 +11,10 @@ of audio from both user input and bot output sources, with support for various a
 configurations and event-driven processing.
 """
 
+import struct
 import time
 
-from pipecat.audio.utils import create_stream_resampler, interleave_stereo_audio, mix_audio
+from pipecat.audio.utils import create_stream_resampler, interleave_stereo_audio, is_silence, mix_audio
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
@@ -85,6 +86,11 @@ class AudioBufferProcessor(FrameProcessor):
         self._bot_speaking = False
         self._user_turn_audio_buffer = bytearray()
         self._bot_turn_audio_buffer = bytearray()
+
+        # Tracks whether to apply a fade-in to the next non-silence bot audio frame.
+        # Set True on BotStartedSpeakingFrame so the first speech chunk of each new
+        # utterance fades in, eliminating the 0→amplitude click at sentence boundaries.
+        self._bot_needs_fade_in: bool = False
 
         self._recording = False
 
@@ -197,8 +203,13 @@ class AudioBufferProcessor(FrameProcessor):
             self._user_speaking = False
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
+            self._bot_needs_fade_in = True
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_speaking = False
+            # Fade out the last few ms of the utterance that just finished so
+            # the transition to silence (or to the next utterance's silence gap)
+            # doesn't create an audible click in the recording.
+            self._apply_fade_out(self._bot_audio_buffer)
 
         resampled = None
         if isinstance(frame, InputAudioRawFrame):
@@ -208,9 +219,11 @@ class AudioBufferProcessor(FrameProcessor):
                 now = time.monotonic()
                 # Insert silence for any wall-clock gap since the user buffer was
                 # last written (covers muted microphone and other silent periods).
-                self._fill_buffer_silence_gap(
+                user_silence_inserted = self._fill_buffer_silence_gap(
                     self._user_audio_buffer, self._last_user_buffer_update_time, now, len(resampled)
                 )
+                if user_silence_inserted:
+                    resampled = self._apply_fade_in(resampled)
                 self._last_user_buffer_update_time = now
                 # Sync bot buffer to current user position before adding user audio.
                 # We sync BEFORE extending to align both buffers at the same starting timestamp.
@@ -245,9 +258,14 @@ class AudioBufferProcessor(FrameProcessor):
                 # Insert silence for any wall-clock gap since the bot buffer was
                 # last written (covers idle periods between bot utterances, e.g.
                 # while a slow function call runs).
-                self._fill_buffer_silence_gap(
+                silence_inserted = self._fill_buffer_silence_gap(
                     self._bot_audio_buffer, self._last_bot_buffer_update_time, now, len(resampled)
                 )
+                # Fade in new audio at the start of each utterance (BotStarted) or
+                # after a long silence gap, to avoid the abrupt 0→amplitude click.
+                if (self._bot_needs_fade_in or silence_inserted) and not is_silence(resampled):
+                    resampled = self._apply_fade_in(resampled)
+                    self._bot_needs_fade_in = False
                 self._last_bot_buffer_update_time = now
                 # Sync user buffer to current bot position before adding bot audio.
                 # Skip silence injection if the user is actively speaking to avoid
@@ -290,13 +308,61 @@ class AudioBufferProcessor(FrameProcessor):
             silence_needed = target_position - current_len
             buffer.extend(b"\x00" * silence_needed)
 
+    # Duration of the crossfade applied at silence boundaries (in seconds).
+    _SILENCE_FADE_S: float = 0.010  # 10 ms
+
+    def _apply_fade_out(self, buffer: bytearray) -> None:
+        """Apply a short linear fade-out to the end of *buffer*.
+
+        Smooths the transition from speech to silence so no abrupt amplitude
+        jump (click/tick) occurs at the silence boundary.
+        """
+        if self._sample_rate == 0 or len(buffer) == 0:
+            return
+        fade_samples = int(self._sample_rate * self._SILENCE_FADE_S)
+        fade_bytes = fade_samples * 2  # 16-bit PCM
+        if len(buffer) < fade_bytes:
+            fade_bytes = len(buffer) & ~1  # use what we have, keep alignment
+            fade_samples = fade_bytes // 2
+        if fade_samples == 0:
+            return
+        start = len(buffer) - fade_bytes
+        for i in range(fade_samples):
+            offset = start + i * 2
+            sample = struct.unpack_from("<h", buffer, offset)[0]
+            fade = (fade_samples - 1 - i) / fade_samples  # 1.0 → 0.0
+            struct.pack_into("<h", buffer, offset, int(sample * fade))
+
+    def _apply_fade_in(self, audio: bytes) -> bytes:
+        """Apply a short linear fade-in to the beginning of *audio*.
+
+        Smooths the transition from silence to speech so no abrupt amplitude
+        jump (click/tick) occurs when an utterance resumes after a gap.
+        """
+        if self._sample_rate == 0 or len(audio) == 0:
+            return audio
+        fade_samples = int(self._sample_rate * self._SILENCE_FADE_S)
+        fade_bytes = fade_samples * 2
+        if len(audio) < fade_bytes:
+            fade_bytes = len(audio) & ~1
+            fade_samples = fade_bytes // 2
+        if fade_samples == 0:
+            return audio
+        buf = bytearray(audio)
+        for i in range(fade_samples):
+            offset = i * 2
+            sample = struct.unpack_from("<h", buf, offset)[0]
+            fade = i / fade_samples  # 0.0 → 1.0
+            struct.pack_into("<h", buf, offset, int(sample * fade))
+        return bytes(buf)
+
     def _fill_buffer_silence_gap(
         self,
         buffer: bytearray,
         last_update_time: float | None,
         now: float,
         frame_bytes: int,
-    ):
+    ) -> bool:
         """Insert silence into a buffer when a wall-clock gap is detected.
 
         Called before adding new audio to a buffer. Compares the elapsed
@@ -305,15 +371,22 @@ class AudioBufferProcessor(FrameProcessor):
         period between bot utterances) is filled with silence so the recorded
         utterances remain temporally separated.
 
+        A short fade-out is applied to the existing buffer before silence is
+        inserted, and the caller should apply a fade-in to the incoming audio
+        frame to avoid audible click/tick artefacts at the boundaries.
+
         Args:
             buffer: The audio buffer to pad (user or bot).
             last_update_time: Monotonic time of the last write to this buffer,
                 or None if the buffer has never been written.
             now: Current monotonic time.
             frame_bytes: Byte length of the incoming (resampled) audio frame.
+
+        Returns:
+            True if silence was inserted (caller should fade-in the new audio).
         """
         if last_update_time is None or self._sample_rate == 0:
-            return
+            return False
 
         elapsed = now - last_update_time
         frame_duration = frame_bytes / (self._sample_rate * 2)
@@ -323,7 +396,10 @@ class AudioBufferProcessor(FrameProcessor):
             silence_bytes = int(gap * self._sample_rate * 2)
             silence_bytes -= silence_bytes % 2  # keep 16-bit alignment
             if silence_bytes > 0:
+                self._apply_fade_out(buffer)
                 buffer.extend(b"\x00" * silence_bytes)
+                return True
+        return False
 
     async def _process_turn_recording(self, frame: Frame, resampled_audio: bytes | None = None):
         """Process frames for turn-based audio recording."""
@@ -389,6 +465,7 @@ class AudioBufferProcessor(FrameProcessor):
         self._reset_all_audio_buffers()
         self._last_user_buffer_update_time = None
         self._last_bot_buffer_update_time = None
+        self._bot_needs_fade_in = False
 
     def _reset_all_audio_buffers(self):
         """Reset all audio buffers to empty state."""

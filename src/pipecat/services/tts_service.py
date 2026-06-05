@@ -7,6 +7,7 @@
 """Base classes for Text-to-speech services."""
 
 import asyncio
+import struct
 import uuid
 import warnings
 from abc import abstractmethod
@@ -158,6 +159,9 @@ class TTSService(AIService):
         push_silence_after_stop: bool = False,
         # if push_silence_after_stop is True, send this amount of audio silence
         silence_time_s: float = 2.0,
+        # silence (in seconds) appended to each sentence's audio inside
+        # tts_process_generator — fires per-sentence regardless of TTSStoppedFrame timing
+        inter_sentence_silence_s: float = 0.0,
         # if True, we will pause processing frames while we are receiving audio
         pause_frame_processing: bool = False,
         # if True, append a trailing space to text before sending to TTS
@@ -279,6 +283,9 @@ class TTSService(AIService):
         self._stop_frame_timeout_s: float = stop_frame_timeout_s
         self._push_silence_after_stop: bool = push_silence_after_stop
         self._silence_time_s: float = silence_time_s
+        self._inter_sentence_silence_s: float = inter_sentence_silence_s
+        # Set after each silence injection; causes fade-in on next sentence's first audio frame.
+        self._next_sentence_needs_fade_in: bool = False
         self._pause_frame_processing: bool = pause_frame_processing
         self._append_trailing_space: bool = append_trailing_space
         self._init_sample_rate = sample_rate
@@ -902,6 +909,7 @@ class TTSService(AIService):
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         self._processing_text = False
         self._sent_non_whitespace_in_context = False
+        self._next_sentence_needs_fade_in = False
         await self._text_aggregator.handle_interruption()
         for filter in self._text_filters:
             await filter.handle_interruption()
@@ -1123,6 +1131,42 @@ class TTSService(AIService):
             for f in self._aggregated_frame_sequencer.complete_spoken_slot():
                 await self.push_frame(f)
 
+    # 10 ms fade applied at inter-sentence silence boundaries.
+    _SENTENCE_FADE_S: float = 0.010
+
+    def _fade_out_tts_frame(self, frame: TTSAudioRawFrame) -> TTSAudioRawFrame:
+        """Linearly fade the last 10 ms of a TTS audio frame to zero."""
+        audio = bytearray(frame.audio)
+        fade_samples = int((frame.sample_rate or self.sample_rate) * self._SENTENCE_FADE_S)
+        fade_bytes = fade_samples * 2
+        if len(audio) < fade_bytes:
+            fade_bytes = len(audio) & ~1
+            fade_samples = fade_bytes // 2
+        if fade_samples == 0:
+            return frame
+        start = len(audio) - fade_bytes
+        for i in range(fade_samples):
+            offset = start + i * 2
+            s = struct.unpack_from("<h", audio, offset)[0]
+            struct.pack_into("<h", audio, offset, int(s * (fade_samples - 1 - i) / fade_samples))
+        return TTSAudioRawFrame(bytes(audio), frame.sample_rate, frame.num_channels, context_id=frame.context_id)
+
+    def _fade_in_tts_frame(self, frame: TTSAudioRawFrame) -> TTSAudioRawFrame:
+        """Linearly fade in the first 10 ms of a TTS audio frame from zero."""
+        audio = bytearray(frame.audio)
+        fade_samples = int((frame.sample_rate or self.sample_rate) * self._SENTENCE_FADE_S)
+        fade_bytes = fade_samples * 2
+        if len(audio) < fade_bytes:
+            fade_bytes = len(audio) & ~1
+            fade_samples = fade_bytes // 2
+        if fade_samples == 0:
+            return frame
+        for i in range(fade_samples):
+            offset = i * 2
+            s = struct.unpack_from("<h", audio, offset)[0]
+            struct.pack_into("<h", audio, offset, int(s * i / fade_samples))
+        return TTSAudioRawFrame(bytes(audio), frame.sample_rate, frame.num_channels, context_id=frame.context_id)
+
     async def tts_process_generator(
         self, context_id: str, generator: AsyncGenerator[Frame | None, None]
     ) -> bool:
@@ -1144,11 +1188,52 @@ class TTSService(AIService):
 
         """
         is_yielding_frames = False
+        last_audio_frame: TTSAudioRawFrame | None = None
+        first_audio = True
+
         async for frame in generator:
-            if frame:
+            if frame is None:
+                continue
+            if isinstance(frame, TTSAudioRawFrame):
+                if first_audio:
+                    # Fade in the first speech frame when resuming after silence.
+                    if self._next_sentence_needs_fade_in:
+                        frame = self._fade_in_tts_frame(frame)
+                        self._next_sentence_needs_fade_in = False
+                    first_audio = False
+                is_yielding_frames = True
+                # Hold the last audio frame so we can fade it out before silence.
+                if last_audio_frame is not None:
+                    await self.append_to_audio_context(context_id, last_audio_frame)
+                last_audio_frame = frame
+            else:
+                # Non-audio frame: flush any buffered audio first.
+                if last_audio_frame is not None:
+                    await self.append_to_audio_context(context_id, last_audio_frame)
+                    last_audio_frame = None
                 await self.append_to_audio_context(context_id, frame)
-                if isinstance(frame, TTSAudioRawFrame):
-                    is_yielding_frames = True
+
+        # Flush the final audio frame, with fade-out when silence will follow.
+        if last_audio_frame is not None:
+            if is_yielding_frames and self._inter_sentence_silence_s > 0:
+                last_audio_frame = self._fade_out_tts_frame(last_audio_frame)
+            await self.append_to_audio_context(context_id, last_audio_frame)
+
+        # Append inter-sentence silence with click-free transitions.
+        if is_yielding_frames and self._inter_sentence_silence_s > 0 and self.sample_rate > 0:
+            silence_bytes = int(self._inter_sentence_silence_s * self.sample_rate * 2)
+            silence_bytes -= silence_bytes % 2
+            if silence_bytes > 0:
+                await self.append_to_audio_context(
+                    context_id,
+                    TTSAudioRawFrame(
+                        audio=b"\x00" * silence_bytes,
+                        sample_rate=self.sample_rate,
+                        num_channels=1,
+                        context_id=context_id,
+                    ),
+                )
+                self._next_sentence_needs_fade_in = True
 
         self._is_yielding_frames_synchronously = is_yielding_frames
 

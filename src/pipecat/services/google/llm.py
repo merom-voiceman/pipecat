@@ -10,6 +10,7 @@ This module provides Google Gemini integration for the Pipecat framework,
 including LLM services, context management, and message aggregation.
 """
 
+import asyncio
 import io
 import os
 import uuid
@@ -53,7 +54,7 @@ os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
 
 try:
     import google.genai as genai
-    from google.api_core.exceptions import DeadlineExceeded
+    from google.api_core.exceptions import DeadlineExceeded, ServiceUnavailable
     from google.genai.types import (
         GenerateContentConfig,
         GenerateContentResponse,
@@ -442,8 +443,23 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         accumulated_text = ""
 
         try:
-            # Generate content from LLMContext
-            response = await self._stream_content(context)
+            # Generate content from LLMContext, with retry for transient 503 errors.
+            _max_retries = 3
+            _delay = 1.0
+            for _attempt in range(_max_retries):
+                try:
+                    response = await self._stream_content(context)
+                    break
+                except ServiceUnavailable as e:
+                    if _attempt < _max_retries - 1:
+                        logger.warning(
+                            f"GoogleLLMService: 503 UNAVAILABLE on attempt {_attempt + 1}, "
+                            f"retrying in {_delay:.1f}s…"
+                        )
+                        await asyncio.sleep(_delay)
+                        _delay *= 2
+                    else:
+                        raise
 
             function_calls = []
             async for chunk in response:
