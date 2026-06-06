@@ -26,7 +26,7 @@ from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType
 # rate/prosody, which is heard as "the voice changing rate" + jumps + ticks at
 # every join. We still insert a space after the merged boundary punctuation so the
 # TTS pauses naturally at the internal "., ! ?" (no rushed run-on).
-_MIN_CHUNK_CHARS: int = 25
+_MIN_CHUNK_CHARS: int = 12
 
 # When the buffer passes this length without a sentence boundary, split it at a
 # COMMA (a natural pause) so a long sentence becomes a couple of breath groups
@@ -63,11 +63,17 @@ _MISSING_SPACE_RE = re.compile(
 # into a single period. The LLM streams dots as separate tokens, so this must run
 # on the assembled sentence (not per-token) to catch them.
 _DOT_RUN_RE = re.compile(r"\.(\s*\.)+")
+# Collapse a sentence-ender followed by spaces and a stray period into just the
+# ender (e.g. "תודה! ." -> "תודה!"), which a newline-after-"!" can produce.
+_PUNCT_THEN_DOT_RE = re.compile(r"([!?.;…])\s*\.")
 
 
 def _clean_sentence(text: str) -> str:
     """Final tidy-up of an assembled chunk before it goes to the TTS."""
     text = _DOT_RUN_RE.sub(".", text)
+    text = _PUNCT_THEN_DOT_RE.sub(r"\1", text)
+    # Strip stray leading punctuation/space (e.g. a chunk that begins ". תגיד").
+    text = text.lstrip(" \t.,;:!?-–—")
     return text.strip()
 
 
