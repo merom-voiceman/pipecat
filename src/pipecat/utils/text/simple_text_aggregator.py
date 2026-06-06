@@ -28,9 +28,15 @@ from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType
 # TTS pauses naturally at the internal "., ! ?" (no rushed run-on).
 _MIN_CHUNK_CHARS: int = 25
 
-# Maximum characters before forcing a phrase split (at a comma, else a space) so
-# no single TTS utterance becomes a multi-second monologue with no breathing point.
-_MAX_PHRASE_CHARS: int = 110
+# When the buffer passes this length without a sentence boundary, split it at a
+# COMMA (a natural pause) so a long sentence becomes a couple of breath groups
+# instead of one monologue. We deliberately do NOT split at an arbitrary space —
+# that produced mid-word cuts ("...גם כשמסביב יש" | "סערות...").
+_MAX_PHRASE_CHARS: int = 120
+
+# Absolute safety cap: only if the buffer is enormous AND has no comma do we fall
+# back to splitting at a space, to avoid an unbounded utterance. Rare.
+_HARD_MAX_CHARS: int = 280
 
 # All single characters (and digraphs) that reliably end a sentence.
 # Used both for lookahead triggering and for space-normalization.
@@ -143,41 +149,41 @@ class SimpleTextAggregator(BaseTextAggregator):
                 yield result
                 continue
 
-            # Hard cap: if the buffer has grown very long without a sentence
-            # boundary, force a split at the last comma or mid-phrase pause so
-            # the TTS never receives an unbounded wall of text.
+            # Long sentence handling: past _MAX_PHRASE_CHARS with no sentence
+            # boundary, split at a COMMA so the long sentence becomes natural
+            # breath groups. If there's no comma we keep accumulating (a clean
+            # long sentence beats a mid-word cut) until the absolute safety cap.
             if len(self._text) >= _MAX_PHRASE_CHARS and not self._needs_lookahead:
-                split_pos = self._find_phrase_split()
+                split_pos = self._find_phrase_split(
+                    allow_space=len(self._text) >= _HARD_MAX_CHARS
+                )
                 if split_pos > 0:
-                    phrase = self._text[:split_pos].strip()
+                    phrase = _clean_sentence(self._text[:split_pos])
                     self._text = self._text[split_pos:].lstrip()
                     if phrase:
-                        logger.debug(
-                            f"aggregator: force-split at {_MAX_PHRASE_CHARS} chars "
-                            f"(pos={split_pos}): {phrase!r}"
+                        logger.info(
+                            f"aggregator: long-sentence split at pos={split_pos} "
+                            f"(buffer was {len(phrase) + len(self._text)} chars): {phrase!r}"
                         )
                         yield Aggregation(text=phrase, type=AggregationType.SENTENCE)
-                else:
-                    logger.debug(
-                        f"aggregator: buffer at {len(self._text)} chars but no split point found"
-                    )
 
-    def _find_phrase_split(self) -> int:
-        """Find the best position to split a long buffer into a shorter phrase.
+    def _find_phrase_split(self, allow_space: bool = False) -> int:
+        """Find a position to split a long buffer at a natural pause.
 
-        Scans backwards from the end looking for a comma, semicolon, or space
-        at which the text can be cleanly divided.  Returns 0 if no suitable
-        split point is found.
+        Prefers the latest comma/semicolon. Only falls back to the last space
+        when ``allow_space`` is set (the absolute safety cap) — splitting at an
+        arbitrary space mid-sentence sounds like a cut, so we avoid it normally.
+        Returns 0 if no acceptable split point is found.
         """
-        # Prefer a comma or semicolon in the last third of the buffer
-        search_from = len(self._text) // 2
+        # Prefer a comma or semicolon in the back half of the buffer.
+        search_from = len(self._text) // 3
         for i in range(len(self._text) - 1, search_from, -1):
-            if self._text[i] in (",", "،", "؛", ";"):
+            if self._text[i] in (",", "،", "؛", ";", "-", "–", "—"):
                 return i + 1  # include the comma
-        # Fall back to last space
-        last_space = self._text.rfind(" ", search_from)
-        if last_space > 0:
-            return last_space + 1
+        if allow_space:
+            last_space = self._text.rfind(" ", search_from)
+            if last_space > 0:
+                return last_space + 1
         return 0
 
     async def _check_sentence_with_lookahead(self, char: str) -> Aggregation | None:
