@@ -35,11 +35,13 @@ _ALL_ENDERS = (
 )
 _ALL_ENDERS_SET: frozenset[str] = frozenset(_ALL_ENDERS)
 
-# Regex: insert a space after any sentence-ending character that is immediately
-# followed by a non-space, non-digit, non-quote character.
-# Covers Hebrew "!מ" → "! מ", ".ל" → ". ל", etc.
+# Regex: insert a space after a sentence-ending character that is immediately
+# followed by a regular (letter) character, e.g. Hebrew "!מ" → "! מ", ".ל" → ". ל".
+# The second group EXCLUDES other enders so we never split runs of punctuation
+# like "..." or ".." into ". . ." (which produced spurious pauses/fragments).
+_ENDERS_ESC = re.escape("".join(_ALL_ENDERS))
 _MISSING_SPACE_RE = re.compile(
-    r"([" + re.escape("".join(_ALL_ENDERS)) + r"])([^\s\d'\"()\[\]])"
+    r"([" + _ENDERS_ESC + r"])([^\s\d'\"()\[\]" + _ENDERS_ESC + r"])"
 )
 
 
@@ -94,8 +96,12 @@ class SimpleTextAggregator(BaseTextAggregator):
 
         logger.debug(f"aggregator: received token {text!r} (buffer={len(self._text)} chars)")
 
-        # 1. Normalise missing spaces after sentence-ending punctuation so NLTK
-        #    can detect boundaries in Hebrew and other scripts that omit spaces.
+        # 1a. Collapse runs of dots (".." / "..." ellipsis) to a single period so
+        #     the TTS gets a clean sentence end instead of an odd trailing-off pause.
+        text = re.sub(r"\.{2,}", ".", text)
+
+        # 1b. Normalise missing spaces after sentence-ending punctuation so NLTK
+        #     can detect boundaries in Hebrew and other scripts that omit spaces.
         text = _MISSING_SPACE_RE.sub(r"\1 \2", text)
 
         # 2. Treat newlines as hard sentence separators (LLMs frequently emit
