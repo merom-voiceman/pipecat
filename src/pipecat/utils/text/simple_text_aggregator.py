@@ -19,9 +19,18 @@ from loguru import logger
 from pipecat.utils.string import SENTENCE_ENDING_PUNCTUATION, match_endofsentence
 from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType, BaseTextAggregator
 
+# Minimum characters before a sentence boundary is allowed to END a chunk.
+# Below this we keep accumulating (merging consecutive short sentences) so the TTS
+# generates ONE longer, continuously-prosodied utterance instead of many tiny
+# clips. Tiny per-sentence clips each generate with a slightly different speaking
+# rate/prosody, which is heard as "the voice changing rate" + jumps + ticks at
+# every join. We still insert a space after the merged boundary punctuation so the
+# TTS pauses naturally at the internal "., ! ?" (no rushed run-on).
+_MIN_CHUNK_CHARS: int = 50
+
 # Maximum characters before forcing a phrase split so no single TTS utterance
 # runs longer than ~2-3 seconds of speech.
-_MAX_PHRASE_CHARS: int = 120
+_MAX_PHRASE_CHARS: int = 160
 
 # All single characters (and digraphs) that reliably end a sentence.
 # Used both for lookahead triggering and for space-normalization.
@@ -43,6 +52,17 @@ _ENDERS_ESC = re.escape("".join(_ALL_ENDERS))
 _MISSING_SPACE_RE = re.compile(
     r"([" + _ENDERS_ESC + r"])([^\s\d'\"()\[\]" + _ENDERS_ESC + r"])"
 )
+
+# Collapse a run of periods possibly separated by spaces ("..", "...", ".. .")
+# into a single period. The LLM streams dots as separate tokens, so this must run
+# on the assembled sentence (not per-token) to catch them.
+_DOT_RUN_RE = re.compile(r"\.(\s*\.)+")
+
+
+def _clean_sentence(text: str) -> str:
+    """Final tidy-up of an assembled chunk before it goes to the TTS."""
+    text = _DOT_RUN_RE.sub(".", text)
+    return text.strip()
 
 
 class SimpleTextAggregator(BaseTextAggregator):
@@ -226,19 +246,31 @@ class SimpleTextAggregator(BaseTextAggregator):
                     eos_marker = last_punct_idx + 1
 
             if eos_marker:
-                result = self._text[:eos_marker].strip()
-                remainder = self._text[eos_marker:].lstrip(" ")
+                candidate = self._text[:eos_marker].strip()
 
-                # Split at EVERY real sentence boundary so each sentence is its own
-                # TTS utterance with a natural breath/gap after it. We deliberately
-                # do NOT merge short sentences (e.g. "שלום!", "מעניין.") into the
-                # next one — merging produced run-on utterances with no pause
-                # ("מצוין.מה לדעתך...") which sound rushed and hard to follow.
-                self._text = remainder
+                # Merge short chunks: if the accumulated text is still shorter than
+                # _MIN_CHUNK_CHARS, do NOT split here. Keep accumulating so the TTS
+                # gets a longer, continuously-generated utterance. Crucially, when
+                # the boundary had no trailing space (Hebrew "מצוין.מה", common when
+                # the LLM streams "." and the next word as separate tokens), insert a
+                # space after the punctuation on the BUFFER so the merged text reads
+                # "מצוין. מה" — the TTS then pauses naturally at the internal period
+                # instead of rushing through a run-on.
+                if len(candidate) < _MIN_CHUNK_CHARS:
+                    if not has_space_gap:
+                        self._text = (
+                            self._text[: last_punct_idx + 1]
+                            + " "
+                            + self._text[last_punct_idx + 1 :]
+                        )
+                    return None
+
+                result = _clean_sentence(candidate)
+                self._text = self._text[eos_marker:].lstrip(" ")
                 # Skip fragments that are only punctuation marks (e.g. lone ".")
                 if result and any(c.isalpha() or c.isdigit() for c in result):
                     logger.debug(
-                        f"aggregator: yielding sentence ({len(result)} chars, "
+                        f"aggregator: yielding chunk ({len(result)} chars, "
                         f"has_space_gap={has_space_gap}): {result!r}"
                     )
                     return Aggregation(text=result, type=AggregationType.SENTENCE)
@@ -267,10 +299,10 @@ class SimpleTextAggregator(BaseTextAggregator):
             return None
 
         if self._text:
-            result = self._text
+            result = _clean_sentence(self._text)
             await self.reset()
             logger.debug(f"aggregator: flush remaining ({len(result)} chars): {result!r}")
-            return Aggregation(text=result.strip(" "), type=AggregationType.SENTENCE)
+            return Aggregation(text=result, type=AggregationType.SENTENCE)
         return None
 
     async def handle_interruption(self):
