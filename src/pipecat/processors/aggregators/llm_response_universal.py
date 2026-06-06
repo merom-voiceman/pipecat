@@ -227,6 +227,7 @@ class LLMAssistantAggregatorParams:
     enable_auto_context_summarization: bool = False
     auto_context_summarization_config: LLMAutoContextSummarizationConfig | None = None
     add_tool_change_messages: bool = False
+    correct_aggregation_callback: Callable[[str], str] | None = None
 
     # ---------------------------------------------------------------------------
     # Deprecated field names — kept for backward compatibility.
@@ -832,6 +833,13 @@ class LLMUserAggregator(LLMContextAggregator):
 
         aggregation = self.aggregation_string()
         await self.reset()
+
+        if self._params.correct_aggregation_callback:
+            try:
+                aggregation = self._params.correct_aggregation_callback(aggregation)
+            except Exception as e:
+                logger.error(f"Error in aggregation correction callback: {e}")
+
         self._context.add_message({"role": self.role, "content": aggregation})
         await self.push_context_frame()
 
