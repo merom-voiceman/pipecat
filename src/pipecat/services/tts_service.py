@@ -378,6 +378,25 @@ class TTSService(AIService):
         """Whether the service is streaming tokens directly without sentence aggregation."""
         return self._text_aggregation_mode == TextAggregationMode.TOKEN
 
+    def add_text_transform(
+        self,
+        aggregation_type: AggregationType | str,
+        transform: Callable[[str, str | AggregationType], Awaitable[str]],
+    ) -> None:
+        """Register a transform applied to aggregated text just before TTS synthesis.
+
+        Transforms only affect the text sent to ``run_tts`` (e.g. injecting
+        engine-specific markup such as SSML ``<phoneme>`` tags). The
+        ``TTSTextFrame``s pushed downstream — and therefore the transcript and
+        the LLM context — keep the original, untransformed text.
+
+        Args:
+            aggregation_type: The aggregation type to apply the transform to,
+                or ``"*"`` to apply it to every type.
+            transform: Async callable ``(text, aggregation_type) -> text``.
+        """
+        self._text_transforms.append((aggregation_type, transform))
+
     async def start_tts_usage_metrics(self, text: str):
         """Record TTS usage metrics.
 
