@@ -26,11 +26,11 @@ from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType
 # rate/prosody, which is heard as "the voice changing rate" + jumps + ticks at
 # every join. We still insert a space after the merged boundary punctuation so the
 # TTS pauses naturally at the internal "., ! ?" (no rushed run-on).
-_MIN_CHUNK_CHARS: int = 50
+_MIN_CHUNK_CHARS: int = 25
 
-# Maximum characters before forcing a phrase split so no single TTS utterance
-# runs longer than ~2-3 seconds of speech.
-_MAX_PHRASE_CHARS: int = 160
+# Maximum characters before forcing a phrase split (at a comma, else a space) so
+# no single TTS utterance becomes a multi-second monologue with no breathing point.
+_MAX_PHRASE_CHARS: int = 110
 
 # All single characters (and digraphs) that reliably end a sentence.
 # Used both for lookahead triggering and for space-normalization.
