@@ -118,10 +118,8 @@ try:
     import uvicorn
     from dotenv import load_dotenv
     from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, WebSocket
-    from fastapi.encoders import jsonable_encoder
-    from fastapi.exceptions import RequestValidationError
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+    from fastapi.responses import HTMLResponse, RedirectResponse
 except ImportError as e:
     logger.error(f"Runner dependencies not available: {e}")
     logger.error("To use Pipecat runners, install with: pip install pipecat-ai[runner]")
@@ -279,14 +277,6 @@ def _print_startup_message(args: argparse.Namespace):
             if args.proxy:
                 print(f"   → XML webhook: http://{args.host}:{args.port}/")
             print(f"   → WebSocket:   ws://{args.host}:{args.port}/ws")
-    elif args.transport == "websocket":
-        print("🚀 Bot ready! (WebSocket)")
-        if not _transport_routes_enabled("websocket"):
-            print(f"   → WebSocket disabled ({TRANSPORT_INSTALL_HINTS['websocket']})")
-        else:
-            print(f"   → Open: {_runner_url(args)}")
-            scheme = "wss" if args.host != "localhost" else "ws"
-            print(f"   → WebSocket:   {scheme}://{args.host}:{args.port}/ws-client")
     elif args.transport == "vonage":
         print()
         print("🚀 Bot ready!")
@@ -384,20 +374,6 @@ def _configure_server_app(args: argparse.Namespace):
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    # FastAPI returns 422 Unprocessable Entity for Pydantic validation failures by default, but
-    # swallows the raw request body in the error response. This handler overrides that behavior to
-    # log both the validation errors and the raw body, making it much easier to debug malformed
-    # payloads from any transport (WhatsApp, WebRTC, telephony, etc.).
-    @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(request: Request, exc: RequestValidationError):
-        body = await request.body()
-        logger.error(f"422 Validation error on {request.url.path}: {exc.errors()}")
-        logger.error(
-            "Raw body: %s",
-            body.decode(errors="replace")[:5000],
-        )
-        return JSONResponse(status_code=422, content=jsonable_encoder({"detail": exc.errors()}))
 
     # Shared session store: session_id -> body data. Used by the WebRTC /start
     # flow and the /sessions/{session_id}/... proxy routes.
@@ -804,7 +780,7 @@ def _setup_whatsapp_routes(app: FastAPI, args: argparse.Namespace):
 
     try:
         from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
-        from pipecat.transports.whatsapp.api import WhatsAppConnectCall, WhatsAppWebhookRequest
+        from pipecat.transports.whatsapp.api import WhatsAppWebhookRequest
         from pipecat.transports.whatsapp.client import WhatsAppClient
     except ImportError as e:
         logger.error(f"WhatsApp transport dependencies not installed: {e}")
@@ -869,22 +845,18 @@ def _setup_whatsapp_routes(app: FastAPI, args: argparse.Namespace):
 
         logger.debug(f"Processing WhatsApp webhook: {body.model_dump()}")
 
-        async def connection_callback(connection: SmallWebRTCConnection, call: WhatsAppConnectCall):
+        async def connection_callback(connection: SmallWebRTCConnection):
             """Handle new WebRTC connections from WhatsApp calls.
 
             Called when a WebRTC connection is established for a WhatsApp call.
             Spawns a bot instance to handle the conversation.
 
             Args:
-                connection: The established WebRTC connection.
-                call: The WhatsApp call metadata (caller phone number, call ID,
-                    direction, timestamp, etc.), passed as ``runner_args.body``.
+                connection: The established WebRTC connection
             """
             bot_module = _get_bot_module()
             runner_args = SmallWebRTCRunnerArguments(
-                webrtc_connection=connection,
-                session_id=str(uuid.uuid4()),
-                body=call,
+                webrtc_connection=connection, session_id=str(uuid.uuid4())
             )
             runner_args.cli_args = args
             background_tasks.add_task(bot_module.bot, runner_args)
@@ -1231,13 +1203,11 @@ def main(parser: argparse.ArgumentParser | None = None):
        - --host: Server host address (default: localhost)
        - --port: Server port (default: 7860)
        - -t/--transport: Restrict to a single transport and set as default for /start
-         (daily, webrtc, websocket, twilio, telnyx, plivo, exotel). Omit to support
-         all transports.
+         (daily, webrtc, twilio, telnyx, plivo, exotel). Omit to support all transports.
        - -x/--proxy: Public proxy hostname for telephony webhooks
        - -d/--direct: Connect directly to Daily room (automatically sets transport to daily)
        - -f/--folder: Path to downloads folder
-       - --dialin/--no-dialin: Mount the Daily PSTN dial-in webhook for -t daily
-         (on by default; --no-dialin disables it)
+       - --dialin: Enable Daily PSTN dial-in webhook handling
        - --esp32: Enable SDP munging for ESP32 compatibility (requires --host with IP address)
        - --whatsapp: Ensure required WhatsApp environment variables are present
        - -v/--verbose: Increase logging verbosity
@@ -1259,7 +1229,7 @@ def main(parser: argparse.ArgumentParser | None = None):
         "-t",
         "--transport",
         type=str,
-        choices=["daily", "vonage", "webrtc", "websocket", *TELEPHONY_TRANSPORTS],
+        choices=["daily", "vonage", "webrtc", *TELEPHONY_TRANSPORTS],
         default=None,
         help=(
             "Restrict the server to a single transport and set it as the default for /start. "
@@ -1280,12 +1250,9 @@ def main(parser: argparse.ArgumentParser | None = None):
     )
     parser.add_argument(
         "--dialin",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Mount the Daily PSTN dial-in webhook for -t daily. On by default (a local "
-            "stand-in for Pipecat Cloud's dial-in handler); use --no-dialin to disable."
-        ),
+        action="store_true",
+        default=False,
+        help="Enable Daily PSTN dial-in webhook handling",
     )
     parser.add_argument(
         "--esp32",
@@ -1319,8 +1286,10 @@ def main(parser: argparse.ArgumentParser | None = None):
         logger.error("For ESP32, you need to specify `--host IP` so we can do SDP munging.")
         return
 
-    # The dial-in webhook is mounted only inside _setup_daily_routes, so --dialin is a
-    # no-op for non-Daily transports; nothing to validate here.
+    # Validate dial-in requirements
+    if args.dialin and args.transport is not None and args.transport != "daily":
+        logger.error("--dialin flag only works with Daily transport (-t daily)")
+        return
 
     # Log level
     logger.remove()

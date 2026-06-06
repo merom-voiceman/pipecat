@@ -406,9 +406,17 @@ class TTSTextFrame(AggregatedTextFrame):
 
     Parameters:
         context_id: Unique identifier for the TTS context that generated this text.
+        persist_to_logs: Engine-side flag indicating downstream observers should
+            write this frame's text to the app-level logs buffer. Default False.
+            Do NOT propagate this flag from TTSSpeakFrame onto TTSTextFrames
+            emitted by the TTS service — word-timestamped providers emit one
+            frame per word, which would produce per-word log entries. Set it
+            only at direct construction sites (e.g. a recording-transcript frame
+            constructed outside the TTS service).
     """
 
     context_id: str | None = None
+    persist_to_logs: bool = False
 
 
 @dataclass
@@ -746,10 +754,14 @@ class TTSSpeakFrame(DataFrame):
     Parameters:
         text: The text to be spoken.
         append_to_context: Whether to append the text to the context.
+        persist_to_logs: If True, observers write this text to the app-level
+            logs buffer when the frame is pushed. The flag intentionally does
+            NOT propagate onto TTSTextFrames emitted by the TTS service.
     """
 
     text: str
     append_to_context: bool | None = None
+    persist_to_logs: bool = False
 
 
 @dataclass
@@ -1129,6 +1141,21 @@ class FunctionCallFromLLM:
 
 
 @dataclass
+class FunctionCallsFromLLMInfoFrame(SystemFrame):
+    """Frame that help trace function calls that are generated from LLM.
+
+    They are emitted so that llm tracing decorators can log tool calls
+    even though there is an interrupt and FunctionCallsStartedFrame can
+    not be emitted
+
+    Parameters:
+        function_calls: Sequence of function calls that will be executed.
+    """
+
+    function_calls: Sequence[FunctionCallFromLLM]
+
+
+@dataclass
 class FunctionCallsStartedFrame(SystemFrame):
     """Frame signaling that function call execution is starting.
 
@@ -1437,30 +1464,6 @@ class STTMetadataFrame(ServiceMetadataFrame):
     """
 
     ttfs_p99_latency: float
-
-
-@dataclass
-class RealtimeServiceMetadataFrame(ServiceMetadataFrame):
-    """Metadata announcing a realtime (speech-to-speech) LLM service.
-
-    Broadcast by realtime LLM services at pipeline start so downstream
-    processors — notably ``LLMContextAggregatorPair`` — can detect that
-    a realtime service is in the pipeline. The aggregator uses this to
-    surface a one-time recommendation to opt in to
-    ``realtime_service_mode=True`` when it hasn't been configured.
-
-    Parameters:
-        emits_user_turn_frames: Whether this service is currently
-            configured to emit ``UserStartedSpeakingFrame`` /
-            ``UserStoppedSpeakingFrame`` from server-side turn signals.
-            False for services with no server-side turn signals at all
-            (e.g. Gemini Live, AWS Nova Sonic, Ultravox), and also
-            False for services whose server-side turn detection has
-            been disabled by configuration (e.g. OpenAI Realtime with
-            ``turn_detection=False``).
-    """
-
-    emits_user_turn_frames: bool = True
 
 
 @dataclass

@@ -14,8 +14,6 @@ WhatsApp call events.
 import asyncio
 import hashlib
 import hmac
-import inspect
-import warnings
 from collections.abc import Awaitable, Callable
 
 import aiohttp
@@ -186,7 +184,7 @@ class WhatsAppClient:
     async def handle_webhook_request(
         self,
         request: WhatsAppWebhookRequest,
-        connection_callback: Callable[..., Awaitable[None]] | None = None,
+        connection_callback: Callable[[SmallWebRTCConnection], Awaitable[None]] | None = None,
         raw_body: bytes | None = None,
         sha256_signature: str | None = None,
     ) -> bool:
@@ -199,18 +197,9 @@ class WhatsAppClient:
 
         Args:
             request: The webhook request from WhatsApp containing call events
-            connection_callback: Optional callback invoked when a new WebRTC
-                               connection is established. Accepts two signatures:
-                               ``(connection, call)`` — preferred, receives the
-                               SmallWebRTCConnection and the WhatsAppConnectCall
-                               with caller metadata; or the legacy
-                               ``(connection,)`` signature.
-
-                               .. deprecated:: 1.4.0
-                                   The single-argument ``(connection,)`` signature is
-                                   deprecated. Use ``(connection, call: WhatsAppConnectCall)``
-                                   instead.
-
+            connection_callback: Optional callback function to invoke when a new
+                               WebRTC connection is established. The callback
+                               receives the SmallWebRTCConnection instance.
             raw_body: Optional bytes containing the raw request body.
             sha256_signature: Optional X-Hub-Signature-256 header value from the request.
 
@@ -237,23 +226,7 @@ class WhatsAppClient:
                                     # Invoke callback if provided
                                     if connection_callback and connection:
                                         try:
-                                            if (
-                                                len(
-                                                    inspect.signature(
-                                                        connection_callback
-                                                    ).parameters
-                                                )
-                                                >= 2
-                                            ):
-                                                await connection_callback(connection, call)
-                                            else:
-                                                warnings.warn(
-                                                    "connection_callback with a single (connection) argument is deprecated. "
-                                                    "Update it to accept (connection, call: WhatsAppConnectCall).",
-                                                    DeprecationWarning,
-                                                    stacklevel=2,
-                                                )
-                                                await connection_callback(connection)
+                                            await connection_callback(connection)
                                             logger.debug(
                                                 f"Connection callback executed successfully for call {call.id}"
                                             )

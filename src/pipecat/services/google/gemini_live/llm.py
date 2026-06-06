@@ -47,7 +47,6 @@ from pipecat.frames.frames import (
     LLMThoughtEndFrame,
     LLMThoughtStartFrame,
     LLMThoughtTextFrame,
-    SpeechControlParamsFrame,
     StartFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
@@ -63,7 +62,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext, LLMSpecificMe
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.google.frames import LLMSearchOrigin, LLMSearchResponseFrame, LLMSearchResult
 from pipecat.services.google.utils import update_google_client_http_options
-from pipecat.services.llm_service import FunctionCallFromLLM, LLMService, RealtimeServiceInfo
+from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.settings import NOT_GIVEN, LLMSettings, _NotGiven, assert_given
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.string import match_endofsentence
@@ -112,15 +111,6 @@ except ModuleNotFoundError as e:
 # Connection management constants
 MAX_CONSECUTIVE_FAILURES = 3
 CONNECTION_ESTABLISHED_THRESHOLD = 10.0  # seconds
-
-# Pre-roll cushion added on top of the auto-sized duration (start_secs), to
-# absorb small timing slop between start_secs and the audio actually clipped,
-# and to give a bit of extra audio context for the model.
-# Not applied to an explicit user_audio_preroll_secs override.
-AUTOSIZED_USER_AUDIO_PREROLL_MARGIN_SECS = 0.1
-# Pre-roll used before start_secs is known (no SpeechControlParamsFrame yet, or
-# no upstream VAD) and no override is given.
-DEFAULT_USER_AUDIO_PREROLL_SECS = 0.5
 
 
 def language_to_gemini_language(language: Language) -> str:
@@ -371,18 +361,6 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
     This service enables real-time conversations with Gemini, supporting both
     text and audio modalities. It handles voice transcription, streaming audio
     responses, and tool usage.
-
-    Does NOT emit ``UserStartedSpeakingFrame`` / ``UserStoppedSpeakingFrame``
-    (the API exposes an ``interrupted`` event but no turn-start/-end), so
-    pipeline processors that depend on those frames — RTVI client speech
-    events, ``TurnTrackingObserver``, ``AudioBufferProcessor`` turn
-    recording, ``UserIdleController``, user mute strategies, voicemail
-    detector — won't activate with the default server-VAD-only setup. Pair
-    with ``LLMContextAggregatorPair(..., realtime_service_mode=True)``
-    so context writes are correct anyway. To produce the turn frames
-    locally, see ``examples/realtime/realtime-gemini-live-locally-driven-turns.py``;
-    note that locally-generated turn boundaries are a heuristic and may
-    not match Gemini Live's server-side turn decisions.
     """
 
     Settings = GeminiLiveLLMSettings
@@ -390,11 +368,6 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
 
     # Overriding the default adapter to use the Gemini one.
     adapter_class = GeminiLLMAdapter
-
-    # Realtime (speech-to-speech) service. Does NOT emit
-    # UserStarted/StoppedSpeakingFrame from server-side turn signals —
-    # the API exposes an `interrupted` event but no turn-start/-end.
-    _realtime_service_info = RealtimeServiceInfo(emits_user_turn_frames=False)
 
     @property
     def _is_gemini_3(self) -> bool:
@@ -423,7 +396,6 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
         params: InputParams | None = None,
         settings: Settings | None = None,
         inference_on_context_initialization: bool = True,
-        user_audio_preroll_secs: float | None = None,
         file_api_base_url: str = "https://generativelanguage.googleapis.com/v1beta/files",
         http_options: HttpOptions | None = None,
         **kwargs,
@@ -454,15 +426,6 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
                 top-level parameters, the ``settings`` values take precedence.
             inference_on_context_initialization: Whether to generate a response when context
                 is first set. Defaults to True.
-            user_audio_preroll_secs: In server-VAD-disabled (locally-driven
-                turns) mode, how much recent audio to replay after
-                activity_start so the speech onset isn't clipped. Defaults to
-                None: auto-sized to the upstream VAD's ``start_secs`` plus a
-                small margin, falling back to ``DEFAULT_USER_AUDIO_PREROLL_SECS``
-                when no VAD is present. Auto-sizing assumes VAD drives turn
-                starts (the default ``VADUserTurnStartStrategy``); set this
-                explicitly if you use a non-VAD turn-start strategy. No effect
-                when server-side VAD is enabled.
             file_api_base_url: Base URL for the Gemini File API. Defaults to the official endpoint.
             http_options: HTTP options for the client.
             **kwargs: Additional arguments passed to parent LLMService.
@@ -565,16 +528,7 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
 
         self._user_is_speaking = False
         self._bot_is_responding = False
-        self._user_audio_preroll_buffer = bytearray()
-        self._user_audio_preroll_buffer_sample_rate: int | None = None
-        # When set, pins the pre-roll duration; otherwise pre-roll is auto-sized
-        # from the upstream VAD's start_secs (see _handle_speech_control_params).
-        self._user_audio_preroll_secs_override = user_audio_preroll_secs
-        self._user_audio_preroll_secs = (
-            user_audio_preroll_secs
-            if user_audio_preroll_secs is not None
-            else DEFAULT_USER_AUDIO_PREROLL_SECS
-        )
+        self._user_audio_buffer = bytearray()
         self._user_transcription_buffer = ""
         self._last_transcription_sent = ""
         self._bot_audio_buffer = bytearray()
@@ -619,6 +573,10 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
         # tool's final result back to the provider, since the async-tool
         # message in the context only carries the id.
         self._tool_call_id_to_name: dict[str, str] = {}
+        # tool_call_id -> (tool_name, tool_result_message). Results are queued
+        # here when the context updates while a reconnect is still in flight,
+        # then replayed once the session is ready again.
+        self._pending_tool_results: dict[str, tuple[str, dict[str, Any]]] = {}
         self._async_tool_warning_logged: bool = False
 
     def create_client(self):
@@ -647,21 +605,32 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
     async def _update_settings(self, delta: LLMSettings) -> dict[str, Any]:
         """Apply a settings delta.
 
-        Settings are stored but not applied to the active connection.
+        Settings are stored but not applied to the active connection unless a
+        subclass opts in via :meth:`_handle_changed_settings`.
         """
         changed = await super()._update_settings(delta)
 
         if not changed:
             return changed
 
-        # TODO: someday we could reconnect here to apply updated settings.
-        # Code might look something like the below:
-        # await self._disconnect()
-        # await self._connect()
-
-        self._warn_unhandled_updated_settings(changed)
+        handled = await self._handle_changed_settings(changed)
+        remaining = {k: v for k, v in changed.items() if k not in handled}
+        self._warn_unhandled_updated_settings(remaining)
 
         return changed
+
+    async def _handle_changed_settings(self, changed: dict[str, Any]) -> set[str]:
+        """Hook for subclasses to react to runtime setting changes.
+
+        Override to act on specific changes (e.g. reconnect to apply a new
+        ``system_instruction``). Return the set of changed keys that were
+        handled, so they're excluded from the unhandled-warning emitted by
+        :meth:`_update_settings`.
+
+        Default: no settings are handled (i.e. all changes are warned about),
+        matching the pre-hook behavior of the base class.
+        """
+        return set()
 
     def set_audio_input_paused(self, paused: bool):
         """Set the audio input pause state.
@@ -713,7 +682,17 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
             frame: The start frame.
         """
         await super().start(frame)
-        await self._connect()
+        if self._should_connect_on_start():
+            await self._connect()
+
+    def _should_connect_on_start(self) -> bool:
+        """Whether to open the connection during :meth:`start`.
+
+        Override to defer connection until a precondition is met (e.g. a
+        system instruction has been set via :meth:`_update_settings`).
+        Defaults to ``True`` (connect immediately on start).
+        """
+        return True
 
     async def stop(self, frame: EndFrame):
         """Stop the service and close connections.
@@ -751,15 +730,12 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
         if self._vad_disabled and self._session and self._ready_for_realtime_input:
             try:
                 await self._session.send_realtime_input(activity_start=ActivityStart())
-                # The speech onset arrived (and was buffered) before this
-                # activity_start. Send it inside the window, so it's not clipped.
-                await self._flush_user_audio_preroll()
             except Exception as e:
                 await self._handle_send_error(e)
 
     async def _handle_user_stopped_speaking(self, frame):
         self._user_is_speaking = False
-        self._user_audio_preroll_buffer = bytearray()
+        self._user_audio_buffer = bytearray()
         await self.start_ttfb_metrics()
         if self._vad_disabled and self._session and self._ready_for_realtime_input:
             try:
@@ -821,9 +797,6 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
             await self.push_frame(frame, direction)
         elif isinstance(frame, BotStoppedSpeakingFrame):
             # ignore this frame. Use the serverContent.turnComplete API message
-            await self.push_frame(frame, direction)
-        elif isinstance(frame, SpeechControlParamsFrame):
-            self._handle_speech_control_params(frame)
             await self.push_frame(frame, direction)
         elif isinstance(frame, LLMMessagesAppendFrame):
             # NOTE: handling LLMMessagesAppendFrame here in the LLMService is
@@ -916,6 +889,7 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
         # freezes during tool execution, so the "keep talking while the tool
         # runs" intent of the flag is structurally not achievable. Surface a
         # one-time warning so users see they're not getting what they expect.
+        logger.debug(f"In _process_completed_function_calls send_new_results: {send_new_results}")
         if not self._supports_non_blocking_tools and not self._async_tool_warning_logged:
             for message in self._context.get_messages():
                 if isinstance(message, LLMSpecificMessage):
@@ -973,11 +947,13 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
                         async_payload.tool_call_id, "tool_call_result"
                     )
                     response_dict = GeminiLLMAdapter.to_function_response_dict(async_payload.result)
+                    delivered = True
                     if send_new_results:
-                        await self._tool_result(
+                        delivered = await self._tool_result(
                             async_payload.tool_call_id, tool_name, response_dict
                         )
-                    self._completed_tool_calls.add(async_payload.tool_call_id)
+                    if not send_new_results or delivered:
+                        self._completed_tool_calls.add(async_payload.tool_call_id)
                     continue
                 # Defensive: any async-tool message must not fall through
                 # to the regular tool-result block below, even if it
@@ -993,9 +969,23 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
                     response_dict = GeminiLLMAdapter.to_function_response_dict(
                         message.get("content")
                     )
+                    delivered = True
                     if send_new_results:
-                        await self._tool_result(tool_call_id, tool_name, response_dict)
-                    self._completed_tool_calls.add(tool_call_id)
+                        delivered = await self._tool_result(tool_call_id, tool_name, response_dict)
+                    if not send_new_results or delivered:
+                        self._completed_tool_calls.add(tool_call_id)
+
+    async def _drain_pending_tool_results(self):
+        """Replay any tool results that were queued during a reconnect gap."""
+        if self._disconnecting or not self._session or not self._pending_tool_results:
+            return
+
+        for tool_call_id, (tool_name, tool_result_message) in list(
+            self._pending_tool_results.items()
+        ):
+            delivered = await self._tool_result(tool_call_id, tool_name, tool_result_message)
+            if delivered:
+                self._completed_tool_calls.add(tool_call_id)
 
     async def _set_bot_is_responding(self, responding: bool):
         if self._bot_is_responding == responding:
@@ -1166,22 +1156,34 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
             # Add system instruction and tools to configuration, if provided.
             # These settings from the context take precedence over the ones
             # provided at initialization time.
+            #
+            # Read system_instruction from self._settings (the latest applied
+            # value), not from self._system_instruction_from_init (frozen at
+            # __init__). Subclasses that opt into runtime updates via
+            # _handle_changed_settings mutate self._settings between connects;
+            # for upstream users who don't, the two values are identical.
             adapter = self.get_llm_adapter()
             system_instruction = None
             tools = None
             if self._context:
                 params = adapter.get_llm_invocation_params(
                     self._context,
-                    system_instruction=assert_given(self._system_instruction_from_init),
+                    system_instruction=self._settings.system_instruction,
                 )
                 system_instruction = params["system_instruction"]
                 tools = params["tools"]
             else:
-                system_instruction = self._system_instruction_from_init
+                system_instruction = self._settings.system_instruction
             if not tools:
                 tools = adapter.from_standard_tools(self._tools_from_init)
             if system_instruction:
-                logger.debug(f"Setting system instruction: {system_instruction}")
+                # Trim very long system instructions in the debug log so call
+                # transcripts in log aggregators stay readable.
+                if len(system_instruction) > 400:
+                    trimmed = f"{system_instruction[:200]}...{system_instruction[-200:]}"
+                else:
+                    trimmed = system_instruction
+                logger.debug(f"Setting system instruction: {trimmed}")
                 config.system_instruction = system_instruction
             if tools:
                 # Tag function declarations registered with
@@ -1215,74 +1217,85 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
             await self.push_error(error_msg=f"Initialization error: {e}", exception=e)
 
     async def _connection_task_handler(self, config: LiveConnectConfig):
-        model = assert_given(self._settings.model)
-        if model is None:
-            raise ValueError("Gemini Live model must be specified")
-        async with self._client.aio.live.connect(model=model, config=config) as session:
-            logger.info("Connected to Gemini service")
+        try:
+            async with self._client.aio.live.connect(
+                model=self._settings.model, config=config
+            ) as session:
+                logger.info("Connected to Gemini service")
 
-            # Mark connection start time
-            self._connection_start_time = time.time()
+                # Mark connection start time
+                self._connection_start_time = time.time()
 
-            await self._handle_session_ready(session)
+                await self._handle_session_ready(session)
 
-            while True:
-                try:
-                    turn = self._session.receive()
-                    async for message in turn:
-                        # Reset failure counter if connection has been stable
-                        self._check_and_reset_failure_counter()
+                while True:
+                    try:
+                        turn = self._session.receive()
+                        async for message in turn:
+                            # Reset failure counter if connection has been stable
+                            self._check_and_reset_failure_counter()
 
-                        # server_content fields are NOT mutually exclusive —
-                        # Gemini 3.x can bundle multiple content fields and
-                        # turn_complete on the same message, so process the
-                        # content-bearing fields before closing the turn.
-                        sc = message.server_content
-                        if sc and sc.interrupted:
-                            # NOTE: while the service triggers interruptions in
-                            # the specific case of barge-ins, it does *not*
-                            # emit UserStarted/StoppedSpeakingFrames, as the
-                            # Gemini Live API does not give us broadly reliable
-                            # signals to base those off of. Pipelines that
-                            # require turn tracking (like those using context
-                            # aggregators) still need an independent way to
-                            # track turns, such as local Silero VAD in
-                            # combination with the context aggregator default
-                            # turn strategies.
-                            logger.debug("Gemini VAD: interrupted signal received")
-                            await self.broadcast_interruption()
-                        if sc and sc.model_turn:
-                            await self._handle_msg_model_turn(message)
-                        if sc and sc.input_transcription:
-                            await self._handle_msg_input_transcription(message)
-                        if sc and sc.output_transcription:
-                            await self._handle_msg_output_transcription(message)
-                        if (
-                            sc
-                            and sc.grounding_metadata
-                            and not sc.model_turn
-                            and not sc.output_transcription
-                        ):
-                            # model_turn/output_transcription already defer
-                            # bundled grounding metadata to turn_complete.
-                            await self._handle_msg_grounding_metadata(message)
-                        if sc and sc.turn_complete:
-                            if not message.usage_metadata:
-                                logger.warning("Received turn_complete without usage_metadata")
-                            await self._handle_msg_turn_complete(message)
-                            if message.usage_metadata:
-                                await self._handle_msg_usage_metadata(message)
-                        if message.tool_call:
-                            await self._handle_msg_tool_call(message)
-                        if message.session_resumption_update:
-                            self._handle_msg_resumption_update(message)
-                except Exception as e:
-                    if not self._disconnecting:
-                        should_reconnect = await self._handle_connection_error(e)
-                        if should_reconnect:
-                            await self._reconnect()
-                            return  # Exit this connection handler, _reconnect will start a new one
-                    break
+                            # server_content fields are NOT mutually exclusive —
+                            # Gemini 3.x can bundle multiple content fields and
+                            # turn_complete on the same message, so process the
+                            # content-bearing fields before closing the turn.
+                            sc = message.server_content
+                            if sc and sc.interrupted:
+                                # NOTE: while the service triggers interruptions in
+                                # the specific case of barge-ins, it does *not*
+                                # emit UserStarted/StoppedSpeakingFrames, as the
+                                # Gemini Live API does not give us broadly reliable
+                                # signals to base those off of. Pipelines that
+                                # require turn tracking (like those using context
+                                # aggregators) still need an independent way to
+                                # track turns, such as local Silero VAD in
+                                # combination with the context aggregator default
+                                # turn strategies.
+                                logger.debug("Gemini VAD: interrupted signal received")
+                                await self.broadcast_interruption()
+                            if sc and sc.model_turn:
+                                await self._handle_msg_model_turn(message)
+                            if sc and sc.input_transcription:
+                                await self._handle_msg_input_transcription(message)
+                            if sc and sc.output_transcription:
+                                await self._handle_msg_output_transcription(message)
+                            if (
+                                sc
+                                and sc.grounding_metadata
+                                and not sc.model_turn
+                                and not sc.output_transcription
+                            ):
+                                # model_turn/output_transcription already defer
+                                # bundled grounding metadata to turn_complete.
+                                await self._handle_msg_grounding_metadata(message)
+                            if sc and sc.turn_complete:
+                                if not message.usage_metadata:
+                                    logger.warning("Received turn_complete without usage_metadata")
+                                await self._handle_msg_turn_complete(message)
+                                if message.usage_metadata:
+                                    await self._handle_msg_usage_metadata(message)
+                            if message.tool_call:
+                                await self._handle_msg_tool_call(message)
+                            if message.session_resumption_update:
+                                self._handle_msg_resumption_update(message)
+                    except Exception as e:
+                        if not self._disconnecting:
+                            should_reconnect = await self._handle_connection_error(e)
+                            if should_reconnect:
+                                await self._reconnect()
+                                return  # Exit this connection handler, _reconnect will start a new one
+                        break
+        except Exception as e:
+            # Connect-time failures (e.g. websocket 1008 "project denied
+            # access") never enter the receive loop above, so they would
+            # otherwise escape this task and be silently caught by the
+            # task manager. Route them through the same error path so an
+            # ErrorFrame is emitted to the pipeline.
+            if self._disconnecting:
+                return
+            should_reconnect = await self._handle_connection_error(e)
+            if should_reconnect:
+                await self._reconnect()
 
     def _check_and_reset_failure_counter(self):
         """Check if connection has been stable long enough to reset the failure counter.
@@ -1316,9 +1329,12 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
         )
 
         if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            # Surface the underlying provider error (e.g. "1008 None. Your
+            # project has been denied access...") so downstream consumers can
+            # show the actual cause rather than the retry-wrapper message.
             error_msg = (
-                f"Max consecutive failures ({MAX_CONSECUTIVE_FAILURES}) reached, "
-                "treating as fatal error"
+                f"Gemini Live connection failed after {MAX_CONSECUTIVE_FAILURES} "
+                f"consecutive attempts: {error}"
             )
             await self.push_error(error_msg=error_msg, exception=error)
             return False
@@ -1350,51 +1366,14 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
             if self._session:
                 await self._session.close()
                 self._session = None
-            self._completed_tool_calls = set()
-            self._tool_call_id_to_name = {}
             self._async_tool_warning_logged = False
             self._ready_for_realtime_input = False
             self._disconnecting = False
         except Exception as e:
             await self.push_error(error_msg=f"Error disconnecting: {e}", exception=e)
 
-    def _handle_speech_control_params(self, frame: SpeechControlParamsFrame):
-        """Auto-size the pre-roll from the upstream VAD's start_secs.
-
-        ``VADController`` broadcasts the current ``VADParams`` at pipeline start
-        (and on any runtime change), so the pre-roll tracks ``start_secs`` — the
-        leading speech local turn detection consumes before confirming the turn
-        — plus a margin.
-
-        This assumes VAD drives turn starts (the default
-        ``VADUserTurnStartStrategy``). With a non-VAD turn-start strategy the
-        onset-to-turn-start gap isn't governed by ``start_secs``; in that case
-        the developer should pin a pre-roll duration via
-        ``user_audio_preroll_secs`` (which short-circuits this).
-
-        This mechanism is harmless when server-side VAD is enabled (the buffer
-        is simply unused).
-        """
-        if self._user_audio_preroll_secs_override is not None:
-            return
-        if frame.vad_params is not None:
-            self._user_audio_preroll_secs = (
-                frame.vad_params.start_secs + AUTOSIZED_USER_AUDIO_PREROLL_MARGIN_SECS
-            )
-
     async def _send_user_audio(self, frame):
-        """Stream user audio to Gemini Live.
-
-        With server-side VAD disabled (locally-driven turns) we honor the
-        activity-window contract: audio is streamed only during an active turn
-        (between activity_start and activity_end), since the service discards
-        anything outside that window. While idle we retain it in a rolling
-        pre-roll buffer that ``_handle_user_started_speaking`` flushes after
-        activity_start to recover the speech onset.
-
-        With server-side VAD enabled we stream continuously, since Gemini's VAD
-        needs the uninterrupted stream to detect turns.
-        """
+        """Send user audio frame to Gemini Live API."""
         if (
             self._audio_input_paused
             or self._disconnecting
@@ -1403,42 +1382,23 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
         ):
             return
 
-        # Send all audio in server-VAD mode, or in local-VAD mode if we're
-        # currently in a user turn. (Otherwise, it'll just live in the pre-roll
-        # buffer, for use when we detect the user has started speaking).
-        if not self._vad_disabled or self._user_is_speaking:
-            try:
-                await self._session.send_realtime_input(
-                    audio=Blob(data=frame.audio, mime_type=f"audio/pcm;rate={frame.sample_rate}")
-                )
-            except Exception as e:
-                await self._handle_send_error(e)
-        else:
-            # Retain the most recent user_audio_preroll_secs as a rolling buffer.
-            self._user_audio_preroll_buffer.extend(frame.audio)
-            preroll_len = int(
-                frame.sample_rate * frame.num_channels * 2 * self._user_audio_preroll_secs
+        # Send all audio to Gemini
+        try:
+            await self._session.send_realtime_input(
+                audio=Blob(data=frame.audio, mime_type=f"audio/pcm;rate={frame.sample_rate}")
             )
-            self._user_audio_preroll_buffer = self._user_audio_preroll_buffer[-preroll_len:]
-            self._user_audio_preroll_buffer_sample_rate = frame.sample_rate
+        except Exception as e:
+            await self._handle_send_error(e)
 
-    async def _flush_user_audio_preroll(self):
-        """Send the buffered pre-roll audio, then clear the buffer.
-
-        Must run inside an active activity window (after activity_start). Raises
-        on send failure so the caller can route it through ``_handle_send_error``.
-        """
-        if (
-            not self._user_audio_preroll_buffer
-            or self._user_audio_preroll_buffer_sample_rate is None
-        ):
-            return
-        audio = bytes(self._user_audio_preroll_buffer)
-        sample_rate = self._user_audio_preroll_buffer_sample_rate
-        self._user_audio_preroll_buffer = bytearray()
-        await self._session.send_realtime_input(
-            audio=Blob(data=audio, mime_type=f"audio/pcm;rate={sample_rate}")
-        )
+        # Manage a buffer of audio to use for transcription
+        audio = frame.audio
+        if self._user_is_speaking:
+            self._user_audio_buffer.extend(audio)
+        else:
+            # Keep 1/2 second of audio in the buffer even when not speaking.
+            self._user_audio_buffer.extend(audio)
+            length = int((frame.sample_rate * frame.num_channels * 2) * 0.5)
+            self._user_audio_buffer = self._user_audio_buffer[-length:]
 
     async def _send_user_text(self, text: str):
         """Send user text via Gemini Live API's realtime input stream.
@@ -1551,10 +1511,6 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
 
         adapter = self.get_llm_adapter()
         messages = adapter.get_llm_invocation_params(self._context).get("messages", [])
-        if not messages:
-            # No messages to seed convo with, so we're ready for realtime input right away
-            self._ready_for_realtime_input = True
-            return
 
         # On reconnect, Gemini 2.5 needs us to force an inference so the user
         # doesn't momentarily experience a "forgotten" assistant (see
@@ -1565,23 +1521,33 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
         else:
             trigger_inference = self._inference_on_context_initialization
 
-        logger.debug(f"Creating initial response: {messages}")
+        logger.debug(f"Creating initial response: {messages} trigger_inference:{trigger_inference}")
 
         # Enforce Gemini 2.5's "seed must end with user turn" requirement.
+        # With no history, send a blank user turn so the session has a valid
+        # seed to commit.
         seed_messages = messages
         if not self._is_gemini_3:
-            last_role = getattr(messages[-1], "role", None)
-            if last_role != "user":
-                seed_messages = messages + [Content(role="user", parts=[Part(text=" ")])]
+            if messages:
+                last_role = getattr(messages[-1], "role", None)
+                if last_role != "user":
+                    seed_messages = messages + [Content(role="user", parts=[Part(text=" ")])]
+            else:
+                seed_messages = [Content(role="user", parts=[Part(text=" ")])]
 
         await self.start_ttfb_metrics()
 
         try:
-            await self._session.send_client_content(
-                turns=seed_messages,
-                turn_complete=trigger_inference,
-            )
-            # Gemini 3.x wants turn_complete=True, but also won't run inference without a realtime input
+            if seed_messages:
+                await self._session.send_client_content(
+                    turns=seed_messages,
+                    turn_complete=trigger_inference,
+                )
+            # Gemini 3.x wants turn_complete=True, but also won't run inference
+            # without a realtime input. The " " nudge is also the only way to
+            # trigger an initial response when the context has just a system
+            # instruction and no message history (e.g. an LLM-driven greeting
+            # off a node prompt) — without it, the session would sit silent.
             if self._is_gemini_3 and trigger_inference:
                 await self._session.send_realtime_input(text=" ")
         except Exception as e:
@@ -1590,7 +1556,7 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
         # Gemini 2.5-only workaround: when we've seeded without triggering
         # inference, flag that the next user_stopped_speaking should send
         # turn_complete=True so 2.5 picks up the seeded history.
-        if not trigger_inference and not self._is_gemini_3:
+        if not trigger_inference and not self._is_gemini_3 and seed_messages:
             self._needs_initial_turn_complete_message = True
 
         self._ready_for_realtime_input = True
@@ -1629,14 +1595,14 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
     @traced_gemini_live(operation="llm_tool_result")
     async def _tool_result(
         self, tool_call_id: str, tool_name: str, tool_result_message: dict[str, Any]
-    ):
+    ) -> bool:
         """Send tool result back to the API."""
         if self._disconnecting or not self._session:
-            return
-
-        logger.debug(
-            f"Sending tool result to Gemini Live for tool_call_id={tool_call_id}, tool_result_message={tool_result_message}"
-        )
+            logger.debug(
+                f"{self}: queueing tool result for tool_call_id={tool_call_id} until session is ready"
+            )
+            self._pending_tool_results[tool_call_id] = (tool_name, tool_result_message)
+            return False
 
         # Pair the NON_BLOCKING declaration on async tools with a
         # scheduling hint on the response. WHEN_IDLE lets Gemini finish
@@ -1658,7 +1624,19 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
         try:
             await self._session.send_tool_response(function_responses=response)
         except Exception as e:
+            self._pending_tool_results[tool_call_id] = (tool_name, tool_result_message)
             await self._handle_send_error(e)
+            return False
+
+        self._pending_tool_results.pop(tool_call_id, None)
+
+        if self._is_gemini_3:
+            try:
+                await self._session.send_realtime_input(text=" ")
+            except Exception as e:
+                await self._handle_send_error(e)
+
+        return True
 
     @traced_gemini_live(operation="llm_setup")
     async def _handle_session_ready(self, session: AsyncSession):
@@ -1672,6 +1650,7 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
             # Reconnect with session resumption: the server will restore
             # session state, so we can accept realtime input right away.
             self._ready_for_realtime_input = True
+            await self._drain_pending_tool_results()
         elif self._context:
             # Reconnect without session resumption (e.g. error occurred
             # before server sent a resumption handle): re-seed conversation
@@ -1766,13 +1745,26 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
     @traced_gemini_live(operation="llm_tool_call")
     async def _handle_msg_tool_call(self, message: LiveServerMessage):
         """Handle tool call messages."""
+        function_calls_llm = self._build_function_calls_from_msg(message)
+        if not function_calls_llm:
+            return
+
+        for fc in function_calls_llm:
+            self._tool_call_id_to_name[fc.tool_call_id] = fc.function_name
+
+        await self._run_or_defer_function_calls(function_calls_llm)
+
+    def _build_function_calls_from_msg(
+        self, message: LiveServerMessage
+    ) -> list[FunctionCallFromLLM]:
+        """Build :class:`FunctionCallFromLLM` instances from a tool-call message."""
         function_calls = message.tool_call.function_calls
         if not function_calls:
-            return
+            return []
         if not self._context:
             logger.error("Function calls are not supported without a context object.")
 
-        function_calls_llm = [
+        return [
             FunctionCallFromLLM(
                 context=self._context,
                 tool_call_id=(
@@ -1786,9 +1778,13 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
             for f in function_calls
         ]
 
-        for fc in function_calls_llm:
-            self._tool_call_id_to_name[fc.tool_call_id] = fc.function_name
+    async def _run_or_defer_function_calls(self, function_calls_llm: list[FunctionCallFromLLM]):
+        """Execute or defer function calls.
 
+        Default: execute immediately via :meth:`run_function_calls`. Override
+        to defer execution based on local state (e.g. wait for the bot's
+        current turn to finish before invoking tools).
+        """
         await self.run_function_calls(function_calls_llm)
 
     @traced_gemini_live(operation="llm_response")

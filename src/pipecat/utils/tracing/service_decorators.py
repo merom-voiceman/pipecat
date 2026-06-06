@@ -16,7 +16,9 @@ import inspect
 import json
 import logging
 from collections.abc import Callable
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
+
+from loguru import logger
 
 # Type imports for type checking only
 if TYPE_CHECKING:
@@ -33,6 +35,18 @@ from pipecat.frames.frames import (
 from pipecat.metrics.metrics import TTFBMetricsData
 from pipecat.processors.aggregators.llm_context import NOT_GIVEN
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.utils.context.message_sanitization import (
+    strip_thought_from_id,
+    strip_thought_ids_from_messages,
+)
+from pipecat.utils.tracing.langfuse_helpers import (
+    build_llm_output_payload,
+    mark_trace_public,
+    set_stt_output_attributes,
+    set_tts_input_attributes,
+    standardize_messages_to_chatml,
+    standardize_tools_to_chatml,
+)
 from pipecat.utils.tracing.service_attributes import (
     add_gemini_live_span_attributes,
     add_llm_span_attributes,
@@ -271,6 +285,7 @@ def traced_tts(func: Callable | None = None, *, name: str | None = None) -> Call
                         parent = _get_turn_context(service) or _get_parent_service_context(service)
                         tracer = trace.get_tracer("pipecat")
                         span = tracer.start_span("tts", context=parent)
+                        mark_trace_public(span)
                         service._tts_spans[context_id] = {"span": span, "ttfb_recorded": False}
 
                         settings = getattr(service, "_settings", None)
@@ -370,10 +385,8 @@ def traced_tts(func: Callable | None = None, *, name: str | None = None) -> Call
             try:
                 context_id = args[0] if args else kwargs.get("context_id")
                 entry = getattr(service, "_tts_spans", {}).get(context_id)
-                if entry and text:
-                    span = entry["span"]
-                    span.set_attribute("text", text)
-                    span.set_attribute("metrics.character_count", len(text))
+                if entry:
+                    set_tts_input_attributes(entry["span"], text)
             except Exception as e:
                 logging.warning(f"Error attaching TTS text to span: {e}")
 
@@ -504,6 +517,7 @@ def traced_stt(func: Callable | None = None, *, name: str | None = None) -> Call
                 )
                 span = tracer.start_span("stt", context=parent, start_time=start_time_ns)
                 try:
+                    mark_trace_public(span)
                     settings = getattr(service, "_settings", None)
                     add_stt_span_attributes(
                         span=span,
@@ -610,7 +624,7 @@ def traced_stt(func: Callable | None = None, *, name: str | None = None) -> Call
                         return
                     if frame.text:
                         update_transcript(state, frame.text)
-                        span.set_attribute("transcript", " ".join(state["segments"]).strip())
+                        set_stt_output_attributes(span, " ".join(state["segments"]).strip())
                     span.set_attribute("is_final", bool(frame.finalized))
                     if frame.language:
                         span.set_attribute("language", str(frame.language))
@@ -751,6 +765,23 @@ def traced_llm(func: Callable | None = None, *, name: str | None = None) -> Call
                 service_class_name = self.__class__.__name__
                 span_name = "llm"
 
+                # Build the span name. If a custom name was supplied to the decorator we
+                # honour that. Otherwise, if the provided context exposes a node name we
+                # append it to the default "llm" prefix so that the span becomes
+                # "llm-{node_name}".
+                if name is not None:
+                    span_name += f"-{name}"
+                else:
+                    otel_span_name = None
+                    try:
+                        otel_span_name = context.get_otel_span_name()
+                    except AttributeError:
+                        otel_span_name = None
+
+                    if otel_span_name:
+                        # Replace whitespace with hyphens for cleaner span names.
+                        span_name = str(otel_span_name).replace(" ", "-").lower()[:20]
+
                 # Get the parent context - turn context if available, otherwise service context
                 parent_context = _get_turn_context(self) or _get_parent_service_context(self)
 
@@ -760,12 +791,19 @@ def traced_llm(func: Callable | None = None, *, name: str | None = None) -> Call
                     span_name, context=parent_context
                 ) as current_span:
                     try:
+                        mark_trace_public(current_span)
+
                         # Store original method and output aggregator
                         original_push_frame = self.push_frame
-                        output_text = ""  # Simple string accumulation
+                        output_text = ""
+
+                        function_calls_info = []
+                        seen_function_call_keys = set()
 
                         async def traced_push_frame(frame, direction=None):
-                            nonlocal output_text
+                            nonlocal output_text, function_calls_info
+                            frame_direction = direction or FrameDirection.DOWNSTREAM
+
                             # Capture text from LLMTextFrame during streaming
                             if (
                                 hasattr(frame, "__class__")
@@ -773,6 +811,34 @@ def traced_llm(func: Callable | None = None, *, name: str | None = None) -> Call
                                 and hasattr(frame, "text")
                             ):
                                 output_text += frame.text
+
+                            # Capture function calls from the regular execution path
+                            # (FunctionCallsStartedFrame) and from the deferred
+                            # execution path (FunctionCallsFromLLMInfoFrame).
+                            if (
+                                hasattr(frame, "__class__")
+                                and frame.__class__.__name__
+                                in ("FunctionCallsFromLLMInfoFrame", "FunctionCallsStartedFrame")
+                                and frame_direction == FrameDirection.DOWNSTREAM
+                            ):
+                                try:
+                                    for call in getattr(frame, "function_calls", []):
+                                        call_info = {
+                                            "function_name": getattr(call, "function_name", None),
+                                            "tool_call_id": strip_thought_from_id(
+                                                getattr(call, "tool_call_id", None)
+                                            ),
+                                            "arguments": getattr(call, "arguments", None),
+                                        }
+                                        call_key = json.dumps(
+                                            call_info, sort_keys=True, default=str
+                                        )
+                                        if call_key in seen_function_call_keys:
+                                            continue
+                                        seen_function_call_keys.add(call_key)
+                                        function_calls_info.append(call_info)
+                                except Exception as e:
+                                    logger.warning(f"Error serializing function call: {e}")
 
                             # Call original
                             if direction is not None:
@@ -805,33 +871,20 @@ def traced_llm(func: Callable | None = None, *, name: str | None = None) -> Call
                             # Use adapter's get_messages_for_logging() which returns
                             # messages in provider's native format with sensitive data sanitized
                             messages = None
-                            serialized_messages = None
 
-                            # Use adapter for provider-native format
                             if hasattr(self, "get_llm_adapter"):
                                 adapter = self.get_llm_adapter()
                                 messages = adapter.get_messages_for_logging(context)
-
-                            # Serialize messages if available
-                            if messages:
-                                serialized_messages = json.dumps(messages)
+                                messages = standardize_messages_to_chatml(messages)
 
                             # Get tools
                             # Use adapter's from_standard_tools() to convert ToolsSchema
                             tools = None
-                            serialized_tools = None
-                            tool_count = 0
 
-                            # Use adapter to convert ToolsSchema
                             if hasattr(self, "get_llm_adapter") and hasattr(context, "tools"):
                                 adapter = self.get_llm_adapter()
                                 tools = adapter.from_standard_tools(context.tools)
-
-                            # Serialize and count tools if available
-                            # Check if tools is not None and not NOT_GIVEN
-                            if tools is not None and tools is not NOT_GIVEN:
-                                serialized_tools = json.dumps(tools)
-                                tool_count = len(tools) if isinstance(tools, list) else 1
+                                tools = standardize_tools_to_chatml(tools)
 
                             # Handle system message for different services
                             # settings.system_instruction takes priority (matches service behavior)
@@ -857,6 +910,13 @@ def traced_llm(func: Callable | None = None, *, name: str | None = None) -> Call
                                                 and part.get("type") == "text"
                                             )
 
+                            # Prepend system message as first message
+                            if system_message and isinstance(messages, list):
+                                if not messages or messages[0].get("role") != "system":
+                                    messages.insert(
+                                        0, {"role": "system", "content": system_message}
+                                    )
+
                             # Use given_fields() defensively in case a service doesn't
                             # initialize all settings.
                             params = {}
@@ -880,25 +940,22 @@ def traced_llm(func: Callable | None = None, *, name: str | None = None) -> Call
                             }
 
                             # Add optional attributes only if they exist
-                            if serialized_messages:
-                                attribute_kwargs["messages"] = serialized_messages
-                            if serialized_tools:
-                                attribute_kwargs["tools"] = serialized_tools
-                                attribute_kwargs["tool_count"] = tool_count
-                            if system_message:
-                                attribute_kwargs["system_instructions"] = system_message
+                            # Strip __thought__ from tool_call_ids in messages
+                            attribute_kwargs["messages"] = (
+                                strip_thought_ids_from_messages(messages) if messages else messages
+                            )
+                            attribute_kwargs["tools"] = tools
 
                             # Add all gathered attributes to the span
                             add_llm_span_attributes(span=current_span, **attribute_kwargs)
 
                         except Exception as e:
-                            logging.warning(f"Error setting up LLM tracing: {e}")
+                            logger.warning(f"Error setting up LLM tracing: {e}")
                             # Don't raise - let the function execute anyway
 
                         # Run function with modified push_frame to capture the output
                         fn_called = True
                         result = await f(self, context, *args, **kwargs)
-
                         return result
 
                     finally:
@@ -911,14 +968,14 @@ def traced_llm(func: Callable | None = None, *, name: str | None = None) -> Call
                         ):
                             self.start_llm_usage_metrics = original_start_llm_usage_metrics
 
-                        # Attach whatever output text we accumulated so
-                        # far. Doing this in finally captures partial
-                        # output when ``f`` is cancelled or raises mid-
-                        # stream (e.g. interruption during LLM
-                        # generation), rather than only on clean
-                        # completion.
-                        if output_text:
-                            current_span.set_attribute("output", output_text)
+                        # Attach output in finally so partial generations
+                        # still show up in traces if ``f`` raises or is
+                        # cancelled. When tool calls are present we emit a
+                        # single JSON payload so Langfuse can display both
+                        # text and tool calls together.
+                        span_output = build_llm_output_payload(output_text, function_calls_info)
+                        if span_output is not None:
+                            current_span.set_attribute("output", span_output)
 
                         # Update TTFB metric
                         ttfb: float | None = getattr(getattr(self, "_metrics", None), "ttfb", None)
@@ -927,7 +984,7 @@ def traced_llm(func: Callable | None = None, *, name: str | None = None) -> Call
             except Exception as e:
                 if fn_called:
                     raise
-                logging.error(f"Error in LLM tracing (continuing without tracing): {e}")
+                logger.error(f"Error in LLM tracing (continuing without tracing): {e}")
                 return await f(self, context, *args, **kwargs)
 
         return wrapper
@@ -976,6 +1033,9 @@ def traced_gemini_live(operation: str) -> Callable:
                     span_name, context=parent_context
                 ) as current_span:
                     try:
+                        # Enable sharing public traces
+                        mark_trace_public(current_span)
+
                         # Base service attributes
                         model_name = _get_model_name(self)
                         voice_id = getattr(self, "_voice_id", None)
@@ -1054,7 +1114,7 @@ def traced_gemini_live(operation: str) -> Callable:
                                         operation_attrs["tools_serialized"] = tools_serialized
 
                                 except Exception as e:
-                                    logging.warning(f"Error serializing tools for tracing: {e}")
+                                    logger.warning(f"Error serializing tools for tracing: {e}")
                                     # Fallback to basic tool count
                                     if tools_list:
                                         operation_attrs["tools"] = tools_list
@@ -1065,19 +1125,6 @@ def traced_gemini_live(operation: str) -> Callable:
                                 operation_attrs["system_instruction"] = system_instruction[
                                     :500
                                 ]  # Truncate if very long
-
-                            # Capture context system instructions if available
-                            if hasattr(self, "_context") and self._context:
-                                try:
-                                    context_system = self._context.extract_system_instructions()
-                                    if context_system:
-                                        operation_attrs["context_system_instruction"] = (
-                                            context_system[:500]
-                                        )  # Truncate if very long
-                                except Exception as e:
-                                    logging.warning(
-                                        f"Error extracting context system instructions: {e}"
-                                    )
 
                         elif operation == "llm_tool_call" and args:
                             # Extract tool call information
@@ -1106,49 +1153,97 @@ def traced_gemini_live(operation: str) -> Callable:
                                     except Exception:
                                         operation_attrs["tool.arguments"] = str(call.args)[:1000]
 
-                        elif operation == "llm_tool_result" and args:
-                            # Extract tool result information
-                            tool_result_message = args[0] if args else None
-                            if tool_result_message and isinstance(tool_result_message, dict):
-                                # Extract the tool call information
-                                tool_call_id = tool_result_message.get("tool_call_id")
-                                tool_call_name = tool_result_message.get("tool_call_name")
-                                result_content = tool_result_message.get("content")
-
-                                if tool_call_id:
-                                    operation_attrs["tool.call_id"] = tool_call_id
-                                if tool_call_name:
-                                    operation_attrs["tool.function_name"] = tool_call_name
-
-                                # Parse and capture the result
-                                if result_content:
+                                    # Set the "output" attribute in ChatML format so Langfuse
+                                    # renders all tool calls in the span's output panel.
+                                    tool_calls_payload = []
+                                    for c in function_calls:
+                                        try:
+                                            arguments = json.dumps(c.args) if c.args else "{}"
+                                        except Exception:
+                                            arguments = str(c.args)
+                                        tool_calls_payload.append(
+                                            {
+                                                "id": strip_thought_from_id(c.id),
+                                                "type": "function",
+                                                "function": {
+                                                    "name": c.name,
+                                                    "arguments": arguments,
+                                                },
+                                            }
+                                        )
                                     try:
-                                        result = json.loads(result_content)
-                                        # Serialize the result, truncating if too long
-                                        result_str = json.dumps(result)
-                                        if len(result_str) > 2000:  # Larger limit for results
-                                            result_str = result_str[:2000] + "..."
-                                        operation_attrs["tool.result"] = result_str
-
-                                        # Add result status/success indicator if present
-                                        if isinstance(result, dict):
-                                            if "error" in result:
-                                                operation_attrs["tool.result_status"] = "error"
-                                            elif "success" in result:
-                                                operation_attrs["tool.result_status"] = "success"
-                                            else:
-                                                operation_attrs["tool.result_status"] = "completed"
-
-                                    except json.JSONDecodeError:
-                                        operation_attrs["tool.result"] = (
-                                            f"Invalid JSON: {str(result_content)[:500]}"
+                                        current_span.set_attribute(
+                                            "output",
+                                            json.dumps({"tool_calls": tool_calls_payload}),
                                         )
-                                        operation_attrs["tool.result_status"] = "parse_error"
                                     except Exception as e:
-                                        operation_attrs["tool.result"] = (
-                                            f"Error processing result: {str(e)}"
-                                        )
-                                        operation_attrs["tool.result_status"] = "processing_error"
+                                        logger.warning(f"Unable to serialize tool_call output: {e}")
+
+                        elif operation == "llm_tool_result" and args:
+                            # _tool_result(self, tool_call_id, tool_name, tool_result_message)
+                            # so positional args are: (call_id, name, result_dict).
+                            tool_call_id = args[0] if len(args) > 0 else None
+                            tool_call_name = args[1] if len(args) > 1 else None
+                            result_content = args[2] if len(args) > 2 else None
+
+                            if tool_call_id:
+                                operation_attrs["tool.call_id"] = strip_thought_from_id(
+                                    tool_call_id
+                                )
+                            if tool_call_name:
+                                operation_attrs["tool.function_name"] = tool_call_name
+
+                            # Capture the result. result_content is the raw response dict
+                            # passed to FunctionResponse.response (not a wrapper with
+                            # tool_call_id/content keys).
+                            if result_content is not None:
+                                try:
+                                    if isinstance(result_content, str):
+                                        try:
+                                            parsed = json.loads(result_content)
+                                        except json.JSONDecodeError:
+                                            parsed = result_content
+                                    else:
+                                        parsed = result_content
+
+                                    result_str = (
+                                        json.dumps(parsed)
+                                        if not isinstance(parsed, str)
+                                        else parsed
+                                    )
+                                    if len(result_str) > 2000:
+                                        result_str = result_str[:2000] + "..."
+                                    operation_attrs["tool.result"] = result_str
+
+                                    if isinstance(parsed, dict):
+                                        if "error" in parsed:
+                                            operation_attrs["tool.result_status"] = "error"
+                                        elif "success" in parsed:
+                                            operation_attrs["tool.result_status"] = "success"
+                                        else:
+                                            operation_attrs["tool.result_status"] = "completed"
+                                except Exception as e:
+                                    operation_attrs["tool.result"] = (
+                                        f"Error processing result: {str(e)}"
+                                    )
+                                    operation_attrs["tool.result_status"] = "processing_error"
+
+                            # Set "output" so Langfuse renders the tool-role response in the
+                            # span panel. The corresponding tool_call is already shown on the
+                            # preceding llm_tool_call span, so we don't duplicate it as input.
+                            output_content = operation_attrs.get("tool.result")
+                            if output_content is not None:
+                                try:
+                                    stripped_id = strip_thought_from_id(tool_call_id) or ""
+                                    output_payload = {
+                                        "role": "tool",
+                                        "tool_call_id": stripped_id,
+                                        "name": tool_call_name or "",
+                                        "content": output_content,
+                                    }
+                                    current_span.set_attribute("output", json.dumps(output_payload))
+                                except Exception as e:
+                                    logger.warning(f"Unable to serialize tool_result output: {e}")
 
                         elif operation == "llm_response" and args:
                             # Extract usage and response metadata from turn complete event
@@ -1234,7 +1329,7 @@ def traced_gemini_live(operation: str) -> Callable:
             except Exception as e:
                 if fn_called:
                     raise
-                logging.error(f"Error in Gemini Live tracing (continuing without tracing): {e}")
+                logger.error(f"Error in Gemini Live tracing (continuing without tracing): {e}")
                 return await func(self, *args, **kwargs)
 
         return wrapper
@@ -1280,6 +1375,9 @@ def traced_openai_realtime(operation: str) -> Callable:
                     span_name, context=parent_context
                 ) as current_span:
                     try:
+                        # Enable sharing public traces
+                        mark_trace_public(current_span)
+
                         # Base service attributes
                         model_name = _get_model_name(self)
 
@@ -1308,7 +1406,7 @@ def traced_openai_realtime(operation: str) -> Callable:
                                         try:
                                             operation_attrs["tools_serialized"] = json.dumps(tools)
                                         except Exception as e:
-                                            logging.warning(f"Error serializing OpenAI tools: {e}")
+                                            logger.warning(f"Error serializing OpenAI tools: {e}")
 
                                     # Extract instructions
                                     instructions = props_dict.get("instructions")
@@ -1316,7 +1414,7 @@ def traced_openai_realtime(operation: str) -> Callable:
                                         operation_attrs["instructions"] = instructions[:500]
 
                                 except Exception as e:
-                                    logging.warning(f"Error processing session properties: {e}")
+                                    logger.warning(f"Error processing session properties: {e}")
 
                             # Also check context for tools
                             if hasattr(self, "_context") and self._context:
@@ -1328,7 +1426,7 @@ def traced_openai_realtime(operation: str) -> Callable:
                                             context_tools
                                         )
                                 except Exception as e:
-                                    logging.warning(f"Error extracting context tools: {e}")
+                                    logger.warning(f"Error extracting context tools: {e}")
 
                         elif operation == "llm_request":
                             # Capture context messages being sent
@@ -1340,7 +1438,7 @@ def traced_openai_realtime(operation: str) -> Callable:
                                     if messages:
                                         operation_attrs["context_messages"] = json.dumps(messages)
                                 except Exception as e:
-                                    logging.warning(f"Error getting context messages: {e}")
+                                    logger.warning(f"Error getting context messages: {e}")
 
                         elif operation == "llm_response" and args:
                             # Extract usage and response metadata
@@ -1455,7 +1553,7 @@ def traced_openai_realtime(operation: str) -> Callable:
             except Exception as e:
                 if fn_called:
                     raise
-                logging.error(f"Error in OpenAI Realtime tracing (continuing without tracing): {e}")
+                logger.error(f"Error in OpenAI Realtime tracing (continuing without tracing): {e}")
                 return await func(self, *args, **kwargs)
 
         return wrapper

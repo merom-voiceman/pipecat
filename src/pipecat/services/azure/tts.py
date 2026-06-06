@@ -140,8 +140,7 @@ class AzureBaseTTSService:
         self,
         *,
         api_key: str,
-        region: str | None = None,
-        private_endpoint: str | None = None,
+        region: str,
     ):
         """Initialize Azure-specific configuration.
 
@@ -150,14 +149,9 @@ class AzureBaseTTSService:
         Args:
             api_key: Azure Cognitive Services subscription key.
             region: Azure region identifier (e.g., "eastus", "westus2").
-                Required unless ``private_endpoint`` is provided.
-            private_endpoint: Custom endpoint URL for Azure Speech Services
-                (e.g., "https://my-resource.cognitiveservices.azure.com/"). Use
-                this when connecting via Private Link or a custom domain.
         """
         self._api_key = api_key
         self._region = region
-        self._private_endpoint = private_endpoint
         self._speech_synthesizer = None
 
     def language_to_service_language(self, language: Language) -> str | None:
@@ -259,8 +253,7 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         self,
         *,
         api_key: str,
-        region: str | None = None,
-        private_endpoint: str | None = None,
+        region: str,
         voice: str | None = None,
         sample_rate: int | None = None,
         params: AzureBaseTTSService.InputParams | None = None,
@@ -274,11 +267,6 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         Args:
             api_key: Azure Cognitive Services subscription key.
             region: Azure region identifier (e.g., "eastus", "westus2").
-                Required unless ``private_endpoint`` is provided.
-            private_endpoint: Custom endpoint URL for Azure Speech Services
-                (e.g., "https://my-resource.cognitiveservices.azure.com/"). Use
-                this when connecting via Private Link or a custom domain. See
-                https://learn.microsoft.com/en-us/azure/ai-services/speech-service/speech-services-private-link
             voice: Voice name to use for synthesis.
 
                 .. deprecated:: 0.0.105
@@ -348,15 +336,8 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
             **kwargs,
         )
 
-        if not region and not private_endpoint:
-            raise ValueError("Either 'region' or 'private_endpoint' must be provided.")
-        if region and private_endpoint:
-            logger.warning(
-                "Both 'region' and 'private_endpoint' provided; 'region' will be ignored."
-            )
-
         # Initialize Azure-specific functionality from mixin
-        self._init_azure_base(api_key=api_key, region=region, private_endpoint=private_endpoint)
+        self._init_azure_base(api_key=api_key, region=region)
 
         self._speech_config = None
         self._speech_synthesizer = None
@@ -393,16 +374,10 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
             return
 
         # Now self.sample_rate is properly initialized
-        if self._private_endpoint:
-            self._speech_config = SpeechConfig(
-                subscription=self._api_key,
-                endpoint=self._private_endpoint,
-            )
-        else:
-            self._speech_config = SpeechConfig(
-                subscription=self._api_key,
-                region=self._region,
-            )
+        self._speech_config = SpeechConfig(
+            subscription=self._api_key,
+            region=self._region,
+        )
         self._speech_config.speech_synthesis_language = self._settings.language
         self._speech_config.set_speech_synthesis_output_format(
             sample_rate_to_output_format(self.sample_rate)
@@ -790,8 +765,7 @@ class AzureHttpTTSService(TTSService, AzureBaseTTSService):
         self,
         *,
         api_key: str,
-        region: str | None = None,
-        private_endpoint: str | None = None,
+        region: str,
         voice: str | None = None,
         sample_rate: int | None = None,
         params: AzureBaseTTSService.InputParams | None = None,
@@ -803,11 +777,6 @@ class AzureHttpTTSService(TTSService, AzureBaseTTSService):
         Args:
             api_key: Azure Cognitive Services subscription key.
             region: Azure region identifier (e.g., "eastus", "westus2").
-                Required unless ``private_endpoint`` is provided.
-            private_endpoint: Custom endpoint URL for Azure Speech Services
-                (e.g., "https://my-resource.cognitiveservices.azure.com/"). Use
-                this when connecting via Private Link or a custom domain. See
-                https://learn.microsoft.com/en-us/azure/ai-services/speech-service/speech-services-private-link
             voice: Voice name to use for synthesis.
 
                 .. deprecated:: 0.0.105
@@ -867,15 +836,8 @@ class AzureHttpTTSService(TTSService, AzureBaseTTSService):
             **kwargs,
         )
 
-        if not region and not private_endpoint:
-            raise ValueError("Either 'region' or 'private_endpoint' must be provided.")
-        if region and private_endpoint:
-            logger.warning(
-                "Both 'region' and 'private_endpoint' provided; 'region' will be ignored."
-            )
-
         # Initialize Azure-specific functionality from mixin
-        self._init_azure_base(api_key=api_key, region=region, private_endpoint=private_endpoint)
+        self._init_azure_base(api_key=api_key, region=region)
 
         self._speech_config = None
         self._speech_synthesizer = None
@@ -899,16 +861,10 @@ class AzureHttpTTSService(TTSService, AzureBaseTTSService):
         if self._speech_config:
             return
 
-        if self._private_endpoint:
-            self._speech_config = SpeechConfig(
-                subscription=self._api_key,
-                endpoint=self._private_endpoint,
-            )
-        else:
-            self._speech_config = SpeechConfig(
-                subscription=self._api_key,
-                region=self._region,
-            )
+        self._speech_config = SpeechConfig(
+            subscription=self._api_key,
+            region=self._region,
+        )
         self._speech_config.speech_synthesis_language = self._settings.language
         self._speech_config.set_speech_synthesis_output_format(
             sample_rate_to_output_format(self.sample_rate)

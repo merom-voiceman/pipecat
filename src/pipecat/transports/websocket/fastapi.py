@@ -39,6 +39,7 @@ from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.utils.enums import EndTaskReason
 
 try:
     from fastapi import WebSocket
@@ -120,6 +121,7 @@ class FastAPIWebsocketClient:
         self._closing = False
         self._callbacks = callbacks
         self._leave_counter = 0
+        self._transfer_in_progress = False
 
     async def setup(self, _: StartFrame):
         """Set up the WebSocket client.
@@ -163,7 +165,18 @@ class FastAPIWebsocketClient:
         if self.is_connected and not self.is_closing:
             self._closing = True
             try:
-                await self._websocket.close()
+                # Cap the close handshake — some peers (notably telephony
+                # providers torn down via a separate REST call) can take the
+                # full 10s websockets-library default to ACK the close, which
+                # blocks pipeline shutdown. The application-state is already
+                # DISCONNECTED by this point, so abandoning the wait is safe.
+                await asyncio.wait_for(self._websocket.close(), timeout=1.0)
+            except TimeoutError:
+                logger.warning(
+                    f"{self} websocket close handshake timed out — "
+                    f"application_state={self._websocket.application_state} "
+                    f"client_state={self._websocket.client_state}"
+                )
             except Exception as e:
                 logger.error(f"{self} exception while closing the websocket: {e}")
 
@@ -321,7 +334,7 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
 
         # Trigger `on_client_disconnected` if the client actually disconnects,
         # that is, we are not the ones disconnecting.
-        if not self._client.is_closing:
+        if not self._client.is_closing and not self._client._transfer_in_progress:
             await self._client.trigger_client_disconnected()
 
     async def _monitor_websocket(self, timeout: int):
@@ -403,6 +416,12 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
             frame: The end frame signaling transport shutdown.
         """
         await super().stop(frame)
+
+        # Lets mark transfer in progress in client, so that we dont call on_client_disconnected
+        # handler if
+        if isinstance(frame, EndFrame) and frame.reason == EndTaskReason.TRANSFER_CALL.value:
+            self._client._transfer_in_progress = True
+
         await self._write_frame(frame)
         await self._client.disconnect()
 

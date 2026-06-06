@@ -10,7 +10,6 @@ This module provides Google Gemini integration for the Pipecat framework,
 including LLM services, context management, and message aggregation.
 """
 
-import asyncio
 import io
 import os
 import uuid
@@ -25,7 +24,13 @@ from pydantic import BaseModel, Field
 from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
 from pipecat.frames.frames import (
     AssistantImageRawFrame,
+    AudioRawFrame,
+    BotStoppedSpeakingFrame,
     Frame,
+    FunctionCallCancelFrame,
+    FunctionCallInProgressFrame,
+    FunctionCallResultFrame,
+    FunctionCallsFromLLMInfoFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -54,7 +59,7 @@ os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
 
 try:
     import google.genai as genai
-    from google.api_core.exceptions import DeadlineExceeded, ServiceUnavailable
+    from google.api_core.exceptions import DeadlineExceeded
     from google.genai.types import (
         GenerateContentConfig,
         GenerateContentResponse,
@@ -255,6 +260,9 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         self._tools = tools
         self._tool_config = tool_config
 
+        # Store pending function calls that need to be executed after TTS
+        self._pending_function_calls = []
+
         # Initialize the API client. Subclasses can override this if needed.
         self.create_client()
 
@@ -442,24 +450,14 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         grounding_metadata = None
         accumulated_text = ""
 
+        text_generated_signal = False
+
+        # Reset pending function calls when processing a new context
+        self._pending_function_calls = []
+
         try:
-            # Generate content from LLMContext, with retry for transient 503 errors.
-            _max_retries = 3
-            _delay = 1.0
-            for _attempt in range(_max_retries):
-                try:
-                    response = await self._stream_content(context)
-                    break
-                except ServiceUnavailable as e:
-                    if _attempt < _max_retries - 1:
-                        logger.warning(
-                            f"GoogleLLMService: 503 UNAVAILABLE on attempt {_attempt + 1}, "
-                            f"retrying in {_delay:.1f}s…"
-                        )
-                        await asyncio.sleep(_delay)
-                        _delay *= 2
-                    else:
-                        raise
+            # Generate content from LLMContext
+            response = await self._stream_content(context)
 
             function_calls = []
             async for chunk in response:
@@ -482,6 +480,22 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                     continue
 
                 for candidate in chunk.candidates:
+                    if candidate.finish_reason:
+                        finish_reason = (
+                            candidate.finish_reason.value
+                            if hasattr(candidate.finish_reason, "value")
+                            else candidate.finish_reason
+                        )
+                        finish_message = (
+                            f" finish_message={candidate.finish_message!r}"
+                            if candidate.finish_message
+                            else ""
+                        )
+                        logger.debug(
+                            f"{self}: Google generation stopped with "
+                            f"finish_reason={finish_reason}{finish_message}"
+                        )
+
                     if candidate.content and candidate.content.parts:
                         for part in candidate.content.parts:
                             function_call_id = None
@@ -494,6 +508,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                                     await self.push_frame(LLMThoughtTextFrame(part.text))
                                     await self.push_frame(LLMThoughtEndFrame())
                                 else:
+                                    text_generated_signal = True
                                     accumulated_text += part.text
                                     await self._push_llm_text(part.text)
                             elif part.function_call:
@@ -609,7 +624,24 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                             "origins": origins,
                         }
 
-            await self.run_function_calls(function_calls)
+            # Handle function calls if any were collected
+            if function_calls:
+                # Send the info frame with function calls so that it can be traced by service_decorators
+                await self.push_frame(
+                    FunctionCallsFromLLMInfoFrame(function_calls=function_calls),
+                    direction=FrameDirection.DOWNSTREAM,
+                )
+
+                # If text was generated, defer function calls until after TTS plays
+                # Otherwise, execute them immediately
+                if text_generated_signal:
+                    self._pending_function_calls = function_calls
+                    logger.debug(
+                        f"{self}: Deferring {len(function_calls)} function calls until after TTS"
+                    )
+                else:
+                    logger.debug(f"{self}: Executing {len(function_calls)} function calls")
+                    await self.run_function_calls(function_calls)
         except DeadlineExceeded:
             await self._call_event_handler("on_completion_timeout")
         except Exception as e:
@@ -643,7 +675,16 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         """
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, LLMContextFrame):
+        # Handle BotStoppedSpeakingFrame to execute pending function calls
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            if self._pending_function_calls:
+                logger.debug(
+                    f"{self}: Executing {len(self._pending_function_calls)} deferred function calls after TTS"
+                )
+                await self.run_function_calls(self._pending_function_calls)
+                self._pending_function_calls = []
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, LLMContextFrame):
             await self._process_context(frame.context)
         else:
             await self.push_frame(frame, direction)

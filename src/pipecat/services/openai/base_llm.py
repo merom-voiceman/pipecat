@@ -28,7 +28,9 @@ from pydantic import BaseModel, Field
 
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMAdapter, OpenAILLMInvocationParams
 from pipecat.frames.frames import (
+    BotStoppedSpeakingFrame,
     Frame,
+    FunctionCallsFromLLMInfoFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -223,6 +225,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         if self._settings.system_instruction:
             logger.debug(f"{self}: Using system instruction: {self._settings.system_instruction}")
 
+        # Store pending function calls that need to be executed after TTS
+        self._pending_function_calls = []
+
     def create_client(
         self,
         api_key=None,
@@ -410,6 +415,12 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         arguments = ""
         tool_call_id = ""
 
+        # Reset pending function calls when processing a new context
+        self._pending_function_calls = []
+
+        # Flag to store whether some text was generated in the current generation
+        text_generated_signal = False
+
         await self.start_ttfb_metrics()
 
         # Generate chat completions from LLMContext
@@ -497,6 +508,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                         # Keep iterating through the response to collect all the argument fragments
                         arguments += tool_call.function.arguments
                 elif chunk.choices[0].delta.content:
+                    text_generated_signal = True
                     await self._push_llm_text(chunk.choices[0].delta.content)
 
                 # When gpt-4o-audio / gpt-4o-mini-audio is used for llm or stt+llm
@@ -537,7 +549,22 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     )
                 )
 
-            await self.run_function_calls(function_calls)
+            # Send the info frame with function calls so that it can be traced by service_decorators
+            await self.push_frame(
+                FunctionCallsFromLLMInfoFrame(function_calls=function_calls),
+                direction=FrameDirection.DOWNSTREAM,
+            )
+
+            # If text was generated, defer function calls until after TTS plays
+            # Otherwise, execute them immediately
+            if text_generated_signal:
+                self._pending_function_calls = function_calls
+                logger.debug(
+                    f"{self}: Deferring {len(function_calls)} function calls until after TTS"
+                )
+            else:
+                logger.debug(f"{self}: Executing {len(function_calls)} function calls")
+                await self.run_function_calls(function_calls)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames for LLM completion requests.
@@ -550,7 +577,16 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         """
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, LLMContextFrame):
+        # Handle BotStoppedSpeakingFrame to execute pending function calls
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            if self._pending_function_calls:
+                logger.debug(
+                    f"{self}: Executing {len(self._pending_function_calls)} deferred function calls after TTS"
+                )
+                await self.run_function_calls(self._pending_function_calls)
+                self._pending_function_calls = []
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, LLMContextFrame):
             try:
                 await self.push_frame(LLMFullResponseStartFrame())
                 await self.start_processing_metrics()
