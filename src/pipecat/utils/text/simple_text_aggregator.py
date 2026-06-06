@@ -26,18 +26,13 @@ from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType
 # rate/prosody, which is heard as "the voice changing rate" + jumps + ticks at
 # every join. We still insert a space after the merged boundary punctuation so the
 # TTS pauses naturally at the internal "., ! ?" (no rushed run-on).
-_MIN_CHUNK_CHARS: int = 12
+_MIN_CHUNK_CHARS: int = 40
 
 # When the buffer passes this length without a sentence boundary, split it at a
 # COMMA (a natural pause) so a long sentence becomes a couple of breath groups
 # instead of one monologue. We deliberately do NOT split at an arbitrary space —
 # that produced mid-word cuts ("...גם כשמסביב יש" | "סערות...").
 _MAX_PHRASE_CHARS: int = 120
-
-# For the FIRST chunk of a turn only: if no sentence boundary is reached by this
-# length, split early at a comma/clause so the bot starts speaking sooner
-# (lower time-to-first-audio). Subsequent chunks use the normal logic above.
-_FIRST_CHUNK_MAX_CHARS: int = 45
 
 # Absolute safety cap: only if the buffer is enormous AND has no comma do we fall
 # back to splitting at a space, to avoid an unbounded utterance. Rare.
@@ -161,25 +156,6 @@ class SimpleTextAggregator(BaseTextAggregator):
                 self._emitted_since_reset = True
                 yield result
                 continue
-
-            # Fast first chunk: get the bot talking sooner. If the first chunk of
-            # a turn hasn't ended in a sentence by _FIRST_CHUNK_MAX_CHARS, split it
-            # early at a comma/clause (or space) so TTS can start while the rest of
-            # the answer is still being generated.
-            if (
-                not self._emitted_since_reset
-                and len(self._text) >= _FIRST_CHUNK_MAX_CHARS
-                and not self._needs_lookahead
-            ):
-                split_pos = self._find_phrase_split(allow_space=True)
-                if split_pos > 0:
-                    phrase = _clean_sentence(self._text[:split_pos])
-                    self._text = self._text[split_pos:].lstrip()
-                    if phrase:
-                        self._emitted_since_reset = True
-                        logger.info(f"aggregator: fast first chunk: {phrase!r}")
-                        yield Aggregation(text=phrase, type=AggregationType.SENTENCE)
-                        continue
 
             # Long sentence handling: past _MAX_PHRASE_CHARS with no sentence
             # boundary, split at a COMMA so the long sentence becomes natural
