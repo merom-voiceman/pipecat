@@ -309,7 +309,7 @@ class AudioBufferProcessor(FrameProcessor):
             buffer.extend(b"\x00" * silence_needed)
 
     # Duration of the crossfade applied at silence boundaries (in seconds).
-    _SILENCE_FADE_S: float = 0.010  # 10 ms
+    _SILENCE_FADE_S: float = 0.020  # 20 ms
 
     def _apply_fade_out(self, buffer: bytearray) -> None:
         """Apply a short linear fade-out to the end of *buffer*.
@@ -440,6 +440,13 @@ class AudioBufferProcessor(FrameProcessor):
 
         # Final alignment before we send the audio
         self._align_track_buffers()
+
+        # Fade the very end of the bot buffer so the next chunk starts cleanly.
+        # Without this, the alignment zero-padding creates an abrupt X→0 click
+        # at every 5-second buffer-flush boundary while the bot is speaking.
+        if self._bot_speaking:
+            self._apply_fade_out(self._bot_audio_buffer)
+            self._bot_needs_fade_in = True
 
         # Call original handler with merged audio
         merged_audio = self.merge_audio_buffers()

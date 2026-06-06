@@ -11,10 +11,34 @@ until it finds an end-of-sentence marker, making it suitable for basic TTS
 text processing scenarios.
 """
 
+import re
 from collections.abc import AsyncIterator
 
 from pipecat.utils.string import SENTENCE_ENDING_PUNCTUATION, match_endofsentence
 from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType, BaseTextAggregator
+
+# Maximum characters before forcing a phrase split so no single TTS utterance
+# runs longer than ~2-3 seconds of speech.
+_MAX_PHRASE_CHARS: int = 120
+
+# All single characters (and digraphs) that reliably end a sentence.
+# Used both for lookahead triggering and for space-normalization.
+_ALL_ENDERS = (
+    ".", "!", "?", ";", "…",          # Latin
+    "。", "？", "！", "；", "．", "｡",  # East-Asian full-width
+    "।", "॥",                          # Devanagari
+    "؟", "؛", "۔",                     # Arabic / Urdu
+    "།", "།", "።", "፧",              # Tibetan, Ethiopic
+    "։", "՜", "՞",                     # Armenian
+)
+_ALL_ENDERS_SET: frozenset[str] = frozenset(_ALL_ENDERS)
+
+# Regex: insert a space after any sentence-ending character that is immediately
+# followed by a non-space, non-digit, non-quote character.
+# Covers Hebrew "!מ" → "! מ", ".ל" → ". ל", etc.
+_MISSING_SPACE_RE = re.compile(
+    r"([" + re.escape("".join(_ALL_ENDERS)) + r"])([^\s\d'\"()\[\]])"
+)
 
 
 class SimpleTextAggregator(BaseTextAggregator):
@@ -66,56 +90,134 @@ class SimpleTextAggregator(BaseTextAggregator):
                 yield Aggregation(text=text, type=AggregationType.TOKEN)
             return
 
+        # 1. Normalise missing spaces after sentence-ending punctuation so NLTK
+        #    can detect boundaries in Hebrew and other scripts that omit spaces.
+        text = _MISSING_SPACE_RE.sub(r"\1 \2", text)
+
+        # 2. Treat newlines as hard sentence separators (LLMs frequently emit
+        #    "\n" between sentences with no punctuation).
+        text = text.replace("\n", ". ")
+
         # Process text character by character
         for char in text:
+            # Sentence-ending punctuation followed immediately by its own kind
+            # (e.g. "?!" or "..") should still trigger, but we only add once.
+            if char == " " and self._text and self._text[-1] == " ":
+                continue  # collapse multiple spaces
+
             self._text += char
 
             # Check for sentence with lookahead
             result = await self._check_sentence_with_lookahead(char)
             if result:
                 yield result
+                continue
+
+            # Hard cap: if the buffer has grown very long without a sentence
+            # boundary, force a split at the last comma or mid-phrase pause so
+            # the TTS never receives an unbounded wall of text.
+            if len(self._text) >= _MAX_PHRASE_CHARS and not self._needs_lookahead:
+                split_pos = self._find_phrase_split()
+                if split_pos > 0:
+                    phrase = self._text[:split_pos].strip()
+                    self._text = self._text[split_pos:].lstrip()
+                    if phrase:
+                        yield Aggregation(text=phrase, type=AggregationType.SENTENCE)
+
+    def _find_phrase_split(self) -> int:
+        """Find the best position to split a long buffer into a shorter phrase.
+
+        Scans backwards from the end looking for a comma, semicolon, or space
+        at which the text can be cleanly divided.  Returns 0 if no suitable
+        split point is found.
+        """
+        # Prefer a comma or semicolon in the last third of the buffer
+        search_from = len(self._text) // 2
+        for i in range(len(self._text) - 1, search_from, -1):
+            if self._text[i] in (",", "،", "؛", ";"):
+                return i + 1  # include the comma
+        # Fall back to last space
+        last_space = self._text.rfind(" ", search_from)
+        if last_space > 0:
+            return last_space + 1
+        return 0
 
     async def _check_sentence_with_lookahead(self, char: str) -> Aggregation | None:
         """Check for sentence boundaries using lookahead logic.
 
-        This method implements the core sentence detection logic with lookahead.
-        When sentence-ending punctuation is detected, it waits for the next
-        non-whitespace character before calling NLTK. This disambiguates cases
-        like "$29." (not a sentence) vs "$29. Next" (sentence ends at period).
-        Whitespace alone is not meaningful lookahead since it appears in both
-        cases. Instead, the first non-whitespace character after the punctuation
-        is used to confirm the sentence boundary.
+        When sentence-ending punctuation is detected we wait for the first
+        non-whitespace lookahead character before deciding.  Two cases:
 
-        Subclasses can call this via super() to reuse the lookahead behavior
-        while adding their own logic (e.g., tag handling, pattern matching).
+        1. **No gap** (punct immediately before lookahead, e.g. ``"מצוין.ת"``):
+           Always a sentence boundary — common in Hebrew/Arabic/CJK where LLMs
+           omit the trailing space.
+
+        2. **Space gap** (punct then spaces then lookahead, e.g. ``"End. Next"``):
+           Ask NLTK to disambiguate (handles ``"Mr. Smith"`` → not a boundary).
+           If NLTK is unsure but the lookahead char is non-ASCII (non-Latin),
+           treat it as a boundary anyway (Latin abbreviations don't apply).
 
         Args:
             char: The most recently added character (used for lookahead check).
 
         Returns:
-            Aggregation if sentence found, None otherwise.
+            Aggregation if a sentence boundary is confirmed, else None.
         """
-        # If we need lookahead, check if we now have non-whitespace
         if self._needs_lookahead:
-            # Check if the new character is non-whitespace
-            if char.strip():
-                # We have meaningful lookahead, call NLTK
-                self._needs_lookahead = False
+            if not char.strip():
+                return None  # Still whitespace — keep waiting
+
+            self._needs_lookahead = False
+
+            # Find the last sentence-ending punctuation in the buffer (it's the
+            # one that originally triggered _needs_lookahead = True).
+            last_punct_idx = -1
+            for i in range(len(self._text) - 2, -1, -1):
+                if self._text[i] in _ALL_ENDERS_SET:
+                    last_punct_idx = i
+                    break
+
+            if last_punct_idx == -1:
+                return None  # No punctuation found (shouldn't happen)
+
+            # Text between the triggering punctuation and the current lookahead
+            # char. Because _needs_lookahead fires on the *first* non-space char,
+            # this region can only contain whitespace (or be empty).
+            between = self._text[last_punct_idx + 1 : len(self._text) - 1]
+            has_space_gap = bool(between)  # True when there are spaces in between
+
+            eos_marker = 0
+            if not has_space_gap:
+                # No space between punct and next char.
+                # Guard: digit after punct = decimal number (e.g. "29.5") → no split.
+                # Guard: punct after punct = consecutive marks (e.g. "..") → no split here,
+                #         the outer punct already set _needs_lookahead for the next char.
+                if char.isdigit() or char in _ALL_ENDERS_SET:
+                    eos_marker = 0
+                else:
+                    # Definite sentence boundary (e.g. Hebrew "מצוין.ת", "נתניהו!הוא")
+                    eos_marker = last_punct_idx + 1
+            else:
+                # Space(s) between punct and next char: let NLTK disambiguate.
                 eos_marker = match_endofsentence(self._text)
 
-                if eos_marker:
-                    # NLTK confirmed a sentence - return it
-                    result = self._text[:eos_marker]
-                    self._text = self._text[eos_marker:]
-                    return Aggregation(text=result.strip(" "), type=AggregationType.SENTENCE)
-                # No sentence found - keep accumulating
-                return None
-            # Still whitespace, keep waiting
+                if eos_marker == 0 and not char.isascii():
+                    # NLTK couldn't confirm, but the next char is non-Latin
+                    # (Hebrew, Arabic, etc.) — definitely a new sentence because
+                    # those scripts don't use Latin-style abbreviations with ".".
+                    eos_marker = last_punct_idx + 1
+
+            if eos_marker:
+                result = self._text[:eos_marker].strip()
+                self._text = self._text[eos_marker:].lstrip(" ")
+                # Skip fragments that are only punctuation marks (e.g. lone ".")
+                if result and any(c.isalpha() or c.isdigit() for c in result):
+                    return Aggregation(text=result, type=AggregationType.SENTENCE)
+
             return None
 
         # Check if we just added sentence-ending punctuation
-        if self._text and self._text[-1] in SENTENCE_ENDING_PUNCTUATION:
-            # Mark that we need lookahead (don't call NLTK yet)
+        if self._text and self._text[-1] in _ALL_ENDERS_SET:
             self._needs_lookahead = True
 
         return None

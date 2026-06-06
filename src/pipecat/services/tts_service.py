@@ -162,6 +162,9 @@ class TTSService(AIService):
         # silence (in seconds) appended to each sentence's audio inside
         # tts_process_generator — fires per-sentence regardless of TTSStoppedFrame timing
         inter_sentence_silence_s: float = 0.0,
+        # optional raw PCM bytes to use as inter-sentence audio instead of silence
+        # (e.g. a breath sound).  Must match sample_rate and 16-bit mono.
+        inter_sentence_audio: bytes | None = None,
         # if True, we will pause processing frames while we are receiving audio
         pause_frame_processing: bool = False,
         # if True, append a trailing space to text before sending to TTS
@@ -284,6 +287,7 @@ class TTSService(AIService):
         self._push_silence_after_stop: bool = push_silence_after_stop
         self._silence_time_s: float = silence_time_s
         self._inter_sentence_silence_s: float = inter_sentence_silence_s
+        self._inter_sentence_audio: bytes | None = inter_sentence_audio
         # Set after each silence injection; causes fade-in on next sentence's first audio frame.
         self._next_sentence_needs_fade_in: bool = False
         self._pause_frame_processing: bool = pause_frame_processing
@@ -1132,7 +1136,7 @@ class TTSService(AIService):
                 await self.push_frame(f)
 
     # 10 ms fade applied at inter-sentence silence boundaries.
-    _SENTENCE_FADE_S: float = 0.010
+    _SENTENCE_FADE_S: float = 0.020  # 20ms — below this threshold clicks are audible
 
     def _fade_out_tts_frame(self, frame: TTSAudioRawFrame) -> TTSAudioRawFrame:
         """Linearly fade the last 10 ms of a TTS audio frame to zero."""
@@ -1213,27 +1217,41 @@ class TTSService(AIService):
                     last_audio_frame = None
                 await self.append_to_audio_context(context_id, frame)
 
-        # Flush the final audio frame, with fade-out when silence will follow.
+        # Flush the final audio frame, with fade-out when any inter-sentence gap follows.
+        _has_gap = self._inter_sentence_audio is not None or self._inter_sentence_silence_s > 0
         if last_audio_frame is not None:
-            if is_yielding_frames and self._inter_sentence_silence_s > 0:
+            if is_yielding_frames and _has_gap:
                 last_audio_frame = self._fade_out_tts_frame(last_audio_frame)
             await self.append_to_audio_context(context_id, last_audio_frame)
 
-        # Append inter-sentence silence with click-free transitions.
-        if is_yielding_frames and self._inter_sentence_silence_s > 0 and self.sample_rate > 0:
-            silence_bytes = int(self._inter_sentence_silence_s * self.sample_rate * 2)
-            silence_bytes -= silence_bytes % 2
-            if silence_bytes > 0:
+        # Append inter-sentence audio (breath or silence) with click-free transitions.
+        if is_yielding_frames and self.sample_rate > 0:
+            if self._inter_sentence_audio is not None:
+                # Use the natural breath/gap sound.
                 await self.append_to_audio_context(
                     context_id,
                     TTSAudioRawFrame(
-                        audio=b"\x00" * silence_bytes,
+                        audio=self._inter_sentence_audio,
                         sample_rate=self.sample_rate,
                         num_channels=1,
                         context_id=context_id,
                     ),
                 )
                 self._next_sentence_needs_fade_in = True
+            elif self._inter_sentence_silence_s > 0:
+                silence_bytes = int(self._inter_sentence_silence_s * self.sample_rate * 2)
+                silence_bytes -= silence_bytes % 2
+                if silence_bytes > 0:
+                    await self.append_to_audio_context(
+                        context_id,
+                        TTSAudioRawFrame(
+                            audio=b"\x00" * silence_bytes,
+                            sample_rate=self.sample_rate,
+                            num_channels=1,
+                            context_id=context_id,
+                        ),
+                    )
+                    self._next_sentence_needs_fade_in = True
 
         self._is_yielding_frames_synchronously = is_yielding_frames
 
