@@ -14,8 +14,15 @@ text processing scenarios.
 import re
 from collections.abc import AsyncIterator
 
+from loguru import logger
+
 from pipecat.utils.string import SENTENCE_ENDING_PUNCTUATION, match_endofsentence
 from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType, BaseTextAggregator
+
+# Minimum characters in buffer before a sentence boundary triggers a split.
+# Prevents single-word exclamations like "שלום!" or "ברוך הבא!" from being
+# dispatched as standalone TTS utterances (sounds like a mid-sentence cut).
+_MIN_PHRASE_CHARS: int = 30
 
 # Maximum characters before forcing a phrase split so no single TTS utterance
 # runs longer than ~2-3 seconds of speech.
@@ -90,6 +97,8 @@ class SimpleTextAggregator(BaseTextAggregator):
                 yield Aggregation(text=text, type=AggregationType.TOKEN)
             return
 
+        logger.debug(f"aggregator: received token {text!r} (buffer={len(self._text)} chars)")
+
         # 1. Normalise missing spaces after sentence-ending punctuation so NLTK
         #    can detect boundaries in Hebrew and other scripts that omit spaces.
         text = _MISSING_SPACE_RE.sub(r"\1 \2", text)
@@ -122,7 +131,15 @@ class SimpleTextAggregator(BaseTextAggregator):
                     phrase = self._text[:split_pos].strip()
                     self._text = self._text[split_pos:].lstrip()
                     if phrase:
+                        logger.debug(
+                            f"aggregator: force-split at {_MAX_PHRASE_CHARS} chars "
+                            f"(pos={split_pos}): {phrase!r}"
+                        )
                         yield Aggregation(text=phrase, type=AggregationType.SENTENCE)
+                else:
+                    logger.debug(
+                        f"aggregator: buffer at {len(self._text)} chars but no split point found"
+                    )
 
     def _find_phrase_split(self) -> int:
         """Find the best position to split a long buffer into a shorter phrase.
@@ -209,10 +226,27 @@ class SimpleTextAggregator(BaseTextAggregator):
 
             if eos_marker:
                 result = self._text[:eos_marker].strip()
-                self._text = self._text[eos_marker:].lstrip(" ")
+                remainder = self._text[eos_marker:].lstrip(" ")
+
+                # Guard: don't split if the candidate phrase is too short.
+                # Short fragments (e.g. "שלום!") sound like mid-sentence cuts.
+                if len(result) < _MIN_PHRASE_CHARS:
+                    logger.debug(
+                        f"aggregator: suppressed split — phrase too short "
+                        f"({len(result)} < {_MIN_PHRASE_CHARS}): {result!r}"
+                    )
+                    return None
+
+                self._text = remainder
                 # Skip fragments that are only punctuation marks (e.g. lone ".")
                 if result and any(c.isalpha() or c.isdigit() for c in result):
+                    logger.debug(
+                        f"aggregator: yielding sentence ({len(result)} chars, "
+                        f"has_space_gap={has_space_gap}): {result!r}"
+                    )
                     return Aggregation(text=result, type=AggregationType.SENTENCE)
+                else:
+                    logger.debug(f"aggregator: skipped punct-only fragment: {result!r}")
 
             return None
 
@@ -236,9 +270,9 @@ class SimpleTextAggregator(BaseTextAggregator):
             return None
 
         if self._text:
-            # Return whatever we have in the buffer
             result = self._text
             await self.reset()
+            logger.debug(f"aggregator: flush remaining ({len(result)} chars): {result!r}")
             return Aggregation(text=result.strip(" "), type=AggregationType.SENTENCE)
         return None
 

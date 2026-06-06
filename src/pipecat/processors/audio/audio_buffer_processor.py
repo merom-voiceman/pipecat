@@ -438,15 +438,21 @@ class AudioBufferProcessor(FrameProcessor):
         if len(self._user_audio_buffer) == 0 and len(self._bot_audio_buffer) == 0:
             return
 
-        # Final alignment before we send the audio
-        self._align_track_buffers()
-
-        # Fade the very end of the bot buffer so the next chunk starts cleanly.
-        # Without this, the alignment zero-padding creates an abrupt X→0 click
-        # at every 5-second buffer-flush boundary while the bot is speaking.
-        if self._bot_speaking:
+        # Fade the bot buffer end ONLY when alignment will zero-pad it (i.e. the
+        # bot track is shorter than the user track). In that case the bot audio
+        # ends abruptly into the silence padding, which clicks without a fade.
+        #
+        # During continuous bot speech the bot track is the longest (it's the one
+        # that hit the buffer-size limit and triggered this flush), so it flows
+        # seamlessly into the next buffer. Fading it here would carve a 20ms dip
+        # into the MIDDLE of a word every buffer-flush (~5s) — the audible "tick"
+        # heard mid-word. So we skip the fade in that case.
+        if self._bot_speaking and len(self._bot_audio_buffer) < len(self._user_audio_buffer):
             self._apply_fade_out(self._bot_audio_buffer)
             self._bot_needs_fade_in = True
+
+        # Final alignment before we send the audio (adds zeros after faded end)
+        self._align_track_buffers()
 
         # Call original handler with merged audio
         merged_audio = self.merge_audio_buffers()

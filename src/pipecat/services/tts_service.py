@@ -1227,6 +1227,10 @@ class TTSService(AIService):
         # Append inter-sentence audio (breath or silence) with click-free transitions.
         if is_yielding_frames and self.sample_rate > 0:
             if self._inter_sentence_audio is not None:
+                logger.info(
+                    f"tts: appending breath ({len(self._inter_sentence_audio)} bytes) "
+                    f"after context {context_id}"
+                )
                 # Use the natural breath/gap sound.
                 await self.append_to_audio_context(
                     context_id,
