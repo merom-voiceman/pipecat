@@ -19,11 +19,6 @@ from loguru import logger
 from pipecat.utils.string import SENTENCE_ENDING_PUNCTUATION, match_endofsentence
 from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType, BaseTextAggregator
 
-# Minimum characters in buffer before a sentence boundary triggers a split.
-# Prevents single-word exclamations like "שלום!" or "ברוך הבא!" from being
-# dispatched as standalone TTS utterances (sounds like a mid-sentence cut).
-_MIN_PHRASE_CHARS: int = 30
-
 # Maximum characters before forcing a phrase split so no single TTS utterance
 # runs longer than ~2-3 seconds of speech.
 _MAX_PHRASE_CHARS: int = 120
@@ -228,15 +223,11 @@ class SimpleTextAggregator(BaseTextAggregator):
                 result = self._text[:eos_marker].strip()
                 remainder = self._text[eos_marker:].lstrip(" ")
 
-                # Guard: don't split if the candidate phrase is too short.
-                # Short fragments (e.g. "שלום!") sound like mid-sentence cuts.
-                if len(result) < _MIN_PHRASE_CHARS:
-                    logger.debug(
-                        f"aggregator: suppressed split — phrase too short "
-                        f"({len(result)} < {_MIN_PHRASE_CHARS}): {result!r}"
-                    )
-                    return None
-
+                # Split at EVERY real sentence boundary so each sentence is its own
+                # TTS utterance with a natural breath/gap after it. We deliberately
+                # do NOT merge short sentences (e.g. "שלום!", "מעניין.") into the
+                # next one — merging produced run-on utterances with no pause
+                # ("מצוין.מה לדעתך...") which sound rushed and hard to follow.
                 self._text = remainder
                 # Skip fragments that are only punctuation marks (e.g. lone ".")
                 if result and any(c.isalpha() or c.isdigit() for c in result):
