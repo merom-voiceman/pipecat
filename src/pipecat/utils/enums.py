@@ -31,6 +31,7 @@ class RealtimeFeedbackType(Enum):
     FUNCTION_CALL_END = "rtf-function-call-end"
     TTFB_METRIC = "rtf-ttfb-metric"
     NODE_TRANSITION = "rtf-node-transition"
+    CALLER_GENDER = "rtf-caller-gender"
     LATENCY_MEASURED = "rtf-latency-measured"
     PIPELINE_ERROR = "rtf-pipeline-error"
     BOT_STARTED_SPEAKING = "rtf-bot-started-speaking"
