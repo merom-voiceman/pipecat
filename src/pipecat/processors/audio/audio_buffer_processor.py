@@ -24,6 +24,7 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,
     OutputAudioRawFrame,
     StartFrame,
+    TTSTextFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
@@ -43,6 +44,9 @@ class AudioBufferProcessor(FrameProcessor):
     - on_track_audio_data: Triggered when buffer_size is reached, providing separate tracks
     - on_user_turn_audio_data: Triggered when user turn has ended, providing that user turn's audio
     - on_bot_turn_audio_data: Triggered when bot turn has ended, providing that bot turn's audio
+    - on_bot_utterance: Triggered when a bot voice segment ends, providing the
+      spoken text and its byte-accurate [start_ms, end_ms] span (and per-word
+      spans) measured against the recorded audio timeline
 
     Audio handling:
 
@@ -99,10 +103,27 @@ class AudioBufferProcessor(FrameProcessor):
         self._last_user_buffer_update_time: float | None = None
         self._last_bot_buffer_update_time: float | None = None
 
+        # --- Byte-accurate bot-utterance boundary capture --------------------
+        # Recording position is measured in BOT-TRACK bytes (mono, 16-bit). The
+        # user and bot buffers are kept length-synced (silence-padded), so a
+        # bot-track byte offset equals the offset into the final merged .wav.
+        # ``_bot_track_emitted`` accumulates the bot-track length of every
+        # flushed on_audio_data chunk so positions survive the periodic buffer
+        # resets (buffer_size flush). Boundaries are taken from where audio is
+        # actually written — never wall-clock — so they line up with the .wav
+        # to the sample, and the bot-stop VAD tail is excluded.
+        self._bot_track_emitted: int = 0
+        self._utt_active: bool = False
+        self._utt_pending_start: bool = False
+        self._utt_start_bytes: int | None = None
+        self._utt_end_bytes: int = 0
+        self._utt_words: list[dict] = []
+
         self._register_event_handler("on_audio_data")
         self._register_event_handler("on_track_audio_data")
         self._register_event_handler("on_user_turn_audio_data")
         self._register_event_handler("on_bot_turn_audio_data")
+        self._register_event_handler("on_bot_utterance")
 
     @property
     def sample_rate(self) -> int:
@@ -163,6 +184,9 @@ class AudioBufferProcessor(FrameProcessor):
 
         Calls audio handlers with any remaining buffered audio before stopping.
         """
+        # Close any in-progress bot utterance (call ended mid-speech) before the
+        # final flush resets the buffers and the byte counters.
+        await self._finalize_bot_utterance()
         await self._call_on_audio_data_handler()
         self._reset_recording()
         self._recording = False
@@ -204,12 +228,33 @@ class AudioBufferProcessor(FrameProcessor):
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
             self._bot_needs_fade_in = True
+            # Open a byte-accurate utterance span. The true onset is marked when
+            # the first bot audio of this utterance is actually written (in the
+            # OutputAudioRawFrame branch) — BotStartedSpeaking can lead the audio
+            # by a frame, so we don't trust this instant for the start offset.
+            self._utt_active = True
+            self._utt_pending_start = True
+            self._utt_start_bytes = None
+            self._utt_end_bytes = self._bot_position_bytes()
+            self._utt_words = []
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_speaking = False
             # Fade out the last few ms of the utterance that just finished so
             # the transition to silence (or to the next utterance's silence gap)
             # doesn't create an audible click in the recording.
             self._apply_fade_out(self._bot_audio_buffer)
+            # Close the span using the position of the LAST audio actually
+            # written — NOT now: BotStoppedSpeaking fires ~350ms (the VAD tail)
+            # after the speech ends, which would otherwise bleed into silence.
+            await self._finalize_bot_utterance()
+        elif isinstance(frame, TTSTextFrame):
+            # Record where each spoken text chunk lands on the recording timeline
+            # (these frames are released by the output transport on its audio
+            # playback clock, so their position tracks the audio closely).
+            if self._utt_active:
+                self._utt_words.append(
+                    {"text": frame.text or "", "at_bytes": self._bot_position_bytes()}
+                )
 
         resampled = None
         if isinstance(frame, InputAudioRawFrame):
@@ -279,8 +324,16 @@ class AudioBufferProcessor(FrameProcessor):
                     # way back to the last user frame (which would double-count
                     # silence already injected by the sync above).
                     self._last_user_buffer_update_time = time.monotonic()
+                # Mark the byte-accurate utterance onset at the first real audio
+                # write (after any gap/sync padding, so it points at speech).
+                if self._utt_pending_start:
+                    self._utt_start_bytes = self._bot_position_bytes()
+                    self._utt_pending_start = False
                 # Add bot audio.
                 self._bot_audio_buffer.extend(resampled)
+                # Extend the utterance end to just past the audio we just wrote.
+                if self._utt_active:
+                    self._utt_end_bytes = self._bot_position_bytes()
 
         if self._buffer_size > 0 and (
             len(self._user_audio_buffer) >= self._buffer_size
@@ -469,9 +522,77 @@ class AudioBufferProcessor(FrameProcessor):
             self._num_channels,
         )
 
+        # Account the bot-track bytes we just flushed so byte-accurate utterance
+        # offsets stay correct after the caller resets the primary buffers. The
+        # tracks are aligned above, so the bot length equals this chunk's
+        # duration on the recording timeline.
+        self._bot_track_emitted += len(self._bot_audio_buffer)
+
     def _buffer_has_audio(self, buffer: bytearray) -> bool:
         """Check if a buffer contains audio data."""
         return buffer is not None and len(buffer) > 0
+
+    def _bot_position_bytes(self) -> int:
+        """Current write position on the bot track, in bytes from recording start.
+
+        Includes bytes already flushed via on_audio_data plus the bytes still in
+        the live bot buffer, so it is stable across buffer_size flushes.
+        """
+        return self._bot_track_emitted + len(self._bot_audio_buffer)
+
+    def _bytes_to_ms(self, num_bytes: int) -> float:
+        """Convert a bot-track byte offset to milliseconds (mono, 16-bit PCM)."""
+        if self._sample_rate <= 0:
+            return 0.0
+        return (num_bytes / (self._sample_rate * 2)) * 1000.0
+
+    async def _finalize_bot_utterance(self):
+        """Emit ``on_bot_utterance`` for the bot voice segment that just ended.
+
+        The span is byte-accurate against the recorded audio timeline: the start
+        is the first audio sample written for the utterance and the end is the
+        last sample written (the bot-stop VAD tail is excluded). Per-word spans
+        are derived from where each TTS text chunk landed. No-op if no audio was
+        actually written during the segment.
+        """
+        active = self._utt_active
+        start_bytes = self._utt_start_bytes
+        end_bytes = self._utt_end_bytes
+        words = self._utt_words
+        # Reset first so a failure can't leak state into the next utterance.
+        self._utt_active = False
+        self._utt_pending_start = False
+        self._utt_start_bytes = None
+        self._utt_end_bytes = 0
+        self._utt_words = []
+
+        if not active or start_bytes is None or end_bytes <= start_bytes:
+            return
+
+        text = "".join(w["text"] for w in words).strip()
+        start_ms = round(self._bytes_to_ms(start_bytes))
+        end_ms = round(self._bytes_to_ms(end_bytes))
+
+        # Per-word spans: each word runs from its own write position to the next
+        # word's (clamped within the utterance). Empty/whitespace chunks dropped.
+        real = [w for w in words if (w["text"] or "").strip()]
+        word_spans: list[dict] = []
+        for i, w in enumerate(real):
+            ws = max(start_bytes, min(w["at_bytes"], end_bytes))
+            we = (
+                end_bytes
+                if i + 1 >= len(real)
+                else max(ws, min(real[i + 1]["at_bytes"], end_bytes))
+            )
+            word_spans.append(
+                {
+                    "text": w["text"],
+                    "start_ms": round(self._bytes_to_ms(ws)),
+                    "end_ms": round(self._bytes_to_ms(we)),
+                }
+            )
+
+        await self._call_event_handler("on_bot_utterance", text, start_ms, end_ms, word_spans)
 
     def _reset_recording(self):
         """Reset recording state and buffers."""
@@ -479,6 +600,13 @@ class AudioBufferProcessor(FrameProcessor):
         self._last_user_buffer_update_time = None
         self._last_bot_buffer_update_time = None
         self._bot_needs_fade_in = False
+        # Byte-accurate utterance capture state.
+        self._bot_track_emitted = 0
+        self._utt_active = False
+        self._utt_pending_start = False
+        self._utt_start_bytes = None
+        self._utt_end_bytes = 0
+        self._utt_words = []
 
     def _reset_all_audio_buffers(self):
         """Reset all audio buffers to empty state."""
